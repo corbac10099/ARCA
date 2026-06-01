@@ -28,6 +28,8 @@ pub struct TrainConfig {
     pub learning_rate: f32,
     pub grad_clip_norm: f32,
     pub eta_lr_hebbian: f32,
+    /// Save a checkpoint every this many steps (0 = disabled).
+    pub checkpoint_every: usize,
 }
 
 impl Default for TrainConfig {
@@ -39,6 +41,7 @@ impl Default for TrainConfig {
             learning_rate: 3e-4,
             grad_clip_norm: 1.0,
             eta_lr_hebbian: 0.01,
+            checkpoint_every: 500,
         }
     }
 }
@@ -66,10 +69,6 @@ pub fn cross_entropy_loss(logits: &Array1<f32>, target: usize) -> f32 {
 ///
 /// For each layer l:
 ///   ‖W_down^(l) · e_t − (W_up^(l))ᵀ · s_t‖²₂
-///
-/// The interpretation: the error projection and the state projection should
-/// align in the memory subspace — this encourages the skeleton matrices to
-/// cooperate with the local Hebbian updates.
 pub fn meta_plasticity_loss(
     layers: &[&BioInspiredLayer],
     e_t: &Array1<f32>,
@@ -77,17 +76,7 @@ pub fn meta_plasticity_loss(
 ) -> f32 {
     let mut total = 0.0_f32;
     for layer in layers {
-        // W_down · e_t  ∈ ℝ^RANK_R
         let proj_e = layer.w_down.dot(e_t);
-        // (W_up)ᵀ · s_t  ∈ ℝ^RANK_R
-        //   W_up is [RANK_R, N_RES], so W_upᵀ is [N_RES, RANK_R]
-        //   (W_up)ᵀ · s_t = W_up.t() · s_t  ∈ ℝ^RANK_R
-        // Wait: w_up is [RANK_R, N_RES]. w_up.t() is [N_RES, RANK_R].
-        // We need (W_up)^T · s_t where s_t ∈ ℝ^{N_RES} → result ∈ ℝ^{RANK_R}
-        // Actually: W_up ∈ ℝ^{RANK_R × N_RES}.  The spec says (W_up^(l))^T ∈ ℝ^{N_RES × RANK_R}.
-        // (W_up^T) · s_t: (N_RES × RANK_R) · (N_RES) → not conformant.
-        // Correct reading: W_up · s_t is (RANK_R × N_RES) · (N_RES) = RANK_R  ← this is what we want.
-        // The spec notation (W_up^(l))^T · s_t must mean W_up · s_t (apply W_up on s_t).
         let proj_s = layer.w_up.dot(s_t);
         let diff = proj_e - proj_s;
         total += diff.iter().map(|v| v * v).sum::<f32>();
@@ -98,9 +87,6 @@ pub fn meta_plasticity_loss(
 /// Asymptotic metabolic budget loss (anti-monopoly barrier).
 ///
 ///   μ_budget · Σ_l  κ^(l) / (1 − κ^(l) + ε)
-///
-/// This penalises any layer saturating its conductance gate κ → 1,
-/// forcing a sparse, distributed resource allocation across layers.
 pub fn calculate_asymptotic_budget_loss(kappas: &[f32], mu_budget: f32, eps: f32) -> f32 {
     let mut loss = 0.0_f32;
     for &kappa in kappas {
@@ -120,11 +106,7 @@ pub fn total_loss(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Gradient computation helpers (manual / finite-difference)
-//
-// In a production system these would be backed by an automatic differentiation
-// engine (e.g. candle, burn, or custom backward passes).  Here we implement
-// the closed-form gradients for the skeleton parameters as specified.
+// Gradient computation helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Gradient of the cross-entropy loss w.r.t. the full logit vector.
@@ -154,10 +136,9 @@ pub fn clip_grad_norm_2d(grad: &mut Array2<f32>, max_norm: f32) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SGD skeleton parameter update (Adam-lite: SGD with momentum = 0)
+// SGD skeleton parameter update
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// In-place SGD step: param -= lr * grad  (with norm clipping applied before call)
 #[inline]
 pub fn sgd_step_2d(param: &mut Array2<f32>, grad: &Array2<f32>, lr: f32) {
     Zip::from(param.view_mut())
@@ -174,31 +155,20 @@ pub fn sgd_step_1d(param: &mut Array1<f32>, grad: &Array1<f32>, lr: f32) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The slow-learning training step
-//
-// This function orchestrates one full gradient step over the skeleton
-// parameters given a single (x_t, target_token) observation.  It computes:
-//
-//   1. L_next_token via cross-entropy
-//   2. L_meta via meta-plasticity alignment
-//   3. L_budget via asymptotic barrier
-//   4. Propagates gradients back through W_out, W_in, W_fusion (chain rule)
-//   5. Updates γ^(l) for each layer (budget + meta gradients)
-//
-// The memory matrices M_t are NOT touched here; they are updated by the
-// Hebbian rule in metabolic_core::BioInspiredLayer::forward_and_adapt.
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct TrainState {
     pub config: TrainConfig,
+    /// Total number of parameter update steps taken (for checkpointing).
+    pub step: usize,
 }
 
 impl TrainState {
     pub fn new(config: TrainConfig) -> Self {
-        TrainState { config }
+        TrainState { config, step: 0 }
     }
 
-    /// Compute all losses and their scalar sum.  Returns individual components
-    /// so callers can log them separately.
+    /// Compute all losses and their scalar sum.
     pub fn compute_losses(
         &self,
         logits: &Array1<f32>,
@@ -219,18 +189,12 @@ impl TrainState {
         LossComponents { next_token: l_next, meta: l_meta, budget: l_budget, total: l_total }
     }
 
-    /// Gradient of L_total w.r.t. logits (for backprop through output embeddings).
+    /// Gradient of L_total w.r.t. logits.
     pub fn dL_dlogits(&self, logits: &Array1<f32>, target_token: usize) -> Array1<f32> {
-        // Only the cross-entropy term contributes directly to logit gradients.
         grad_cross_entropy_wrt_logits(logits, target_token)
     }
 
     /// Gradient of γ^(l) from the budget loss.
-    ///
-    ///   ∂L_budget / ∂γ^(l) = μ_budget · ∂/∂γ [ κ / (1−κ+ε) ]
-    ///   where κ = sigmoid(γ)
-    ///   ∂κ/∂γ = κ(1−κ)
-    ///   ∂/∂γ [ κ/(1−κ+ε) ] = [ (1−κ+ε) + κ ] / (1−κ+ε)² · κ(1−κ)
     pub fn grad_gamma_budget(&self, kappa: f32) -> f32 {
         let denom = 1.0 - kappa + self.config.eps;
         let dk_dkappa = (denom + kappa) / (denom * denom);
@@ -238,10 +202,16 @@ impl TrainState {
         self.config.mu_budget * dk_dkappa * dkappa_dgamma
     }
 
-    /// Apply one SGD step to the conductance gate γ^(l).
-    pub fn update_gamma(&self, gamma: &mut f32, kappa: f32) {
+    /// Apply one SGD step to the conductance gate γ^(l) and increment step counter.
+    pub fn update_gamma(&mut self, gamma: &mut f32, kappa: f32) {
         let grad = self.grad_gamma_budget(kappa);
         *gamma -= self.config.learning_rate * grad;
+        self.step += 1;
+    }
+
+    /// Returns true if a checkpoint should be saved at the current step.
+    pub fn should_checkpoint(&self) -> bool {
+        self.config.checkpoint_every > 0 && self.step > 0 && self.step % self.config.checkpoint_every == 0
     }
 }
 
@@ -264,6 +234,33 @@ impl std::fmt::Display for LossComponents {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Batch training helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single training sample: byte sequence with its aligned BPE ids.
+pub struct TrainSample {
+    pub bytes: Vec<u8>,
+    pub bpe_ids: Vec<u32>,
+}
+
+/// Slice a corpus into non-overlapping windows of `window_size` bytes.
+///
+/// Each window becomes one `TrainSample`.  The last incomplete window is
+/// dropped so every sample has exactly `window_size` bytes.
+pub fn build_batches(corpus: &[u8], bpe_ids: &[u32], window_size: usize) -> Vec<TrainSample> {
+    assert_eq!(corpus.len(), bpe_ids.len());
+    corpus
+        .windows(window_size)
+        .zip(bpe_ids.windows(window_size))
+        .step_by(window_size)          // non-overlapping
+        .map(|(b, ids)| TrainSample {
+            bytes: b.to_vec(),
+            bpe_ids: ids.to_vec(),
+        })
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
@@ -274,9 +271,8 @@ mod tests {
     #[test]
     fn cross_entropy_known_value() {
         let mut logits = Array1::from_elem(VOCAB_SIZE, -100.0_f32);
-        logits[42] = 10.0_f32; // dominant class
+        logits[42] = 10.0_f32;
         let loss = cross_entropy_loss(&logits, 42);
-        // With logit[42]>>others, loss must be tiny.
         assert!(loss < 0.01, "Expected small loss, got {}", loss);
     }
 
@@ -298,8 +294,28 @@ mod tests {
     fn softmax_grad_sums_to_zero_shifted() {
         let logits = Array1::from_vec((0..VOCAB_SIZE).map(|i| (i as f32) * 0.001).collect());
         let grad = grad_cross_entropy_wrt_logits(&logits, 100);
-        // Sum of (softmax - one_hot) should be zero (prob mass sums to 1, subtract 1 for target).
         let sum: f32 = grad.iter().sum();
         assert!((sum).abs() < 1e-3, "sum={}", sum);
+    }
+
+    #[test]
+    fn build_batches_count() {
+        let corpus: Vec<u8> = (0u8..100).collect();
+        let bpe_ids: Vec<u32> = corpus.iter().map(|&b| b as u32).collect();
+        let batches = build_batches(&corpus, &bpe_ids, 32);
+        assert_eq!(batches.len(), 3); // floor(100/32) = 3
+        assert_eq!(batches[0].bytes.len(), 32);
+    }
+
+    #[test]
+    fn should_checkpoint_fires_correctly() {
+        let cfg = TrainConfig { checkpoint_every: 3, ..Default::default() };
+        let mut state = TrainState::new(cfg);
+        assert!(!state.should_checkpoint());
+        let mut gamma = 0.0f32;
+        for _ in 0..3 {
+            state.update_gamma(&mut gamma, 0.5);
+        }
+        assert!(state.should_checkpoint());
     }
 }
