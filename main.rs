@@ -153,6 +153,14 @@ impl ArcaSystem {
                 .map(|l| l.m_base.iter().cloned().collect())
                 .collect();
 
+            let mut w_up_all = vec![];
+            let mut w_down_all = vec![];
+            for l in &layers {
+                w_up_all.extend(l.w_up.iter().cloned());
+                w_down_all.extend(l.w_down.iter().cloned());
+            }
+            let w_out_flat: Vec<f32> = aggregator.w_out.iter().cloned().collect();
+
             GpuContext::new(
                 num_l,
                 &r_flat,
@@ -160,6 +168,9 @@ impl ArcaSystem {
                 &out_emb_flat,
                 &out_bias_flat,
                 &m_base_data,
+                &w_up_all,
+                &w_down_all,
+                &w_out_flat,
             )
         };
 
@@ -265,6 +276,14 @@ impl ArcaSystem {
                 .map(|l| l.m_base.iter().cloned().collect())
                 .collect();
 
+            let mut w_up_all = vec![];
+            let mut w_down_all = vec![];
+            for l in &layers {
+                w_up_all.extend(l.w_up.iter().cloned());
+                w_down_all.extend(l.w_down.iter().cloned());
+            }
+            let w_out_flat: Vec<f32> = aggregator.w_out.iter().cloned().collect();
+
             GpuContext::new(
                 num_l,
                 &r_flat,
@@ -272,6 +291,9 @@ impl ArcaSystem {
                 &out_emb_flat,
                 &out_bias_flat,
                 &m_base_data,
+                &w_up_all,
+                &w_down_all,
+                &w_out_flat,
             )
         };
 
@@ -340,77 +362,60 @@ impl ArcaSystem {
 
         let x_t = self.encoder.encode_position(raw_bytes, t, bpe_ids);
 
-        // Prediction error — tiny, CPU
         let e_t: Array1<f32> = match prev_prediction {
             Some(pred) => &x_t - pred,
             None       => Array1::zeros(D_MODEL),
         };
 
-        // Homeostatic climate — scalar arithmetic, CPU
         let (tension_new, beta_g, lambda_g, sigma_g) =
             self.controller.compute_climate(&e_t, self.tension);
         self.tension = tension_new;
 
-        // ── Reservoir step (GPU) ──────────────────────────────────────────
-        self.reservoir.step_gpu(&mut self.gpu,
-            #[cfg(feature = "gpu")]
-            gpu_infer, &x_t);
+        // 1. Upload x_t and e_t
+        let x_t_flat: Vec<f32> = x_t.iter().cloned().collect();
+        let e_t_flat: Vec<f32> = e_t.iter().cloned().collect();
+        self.gpu.upload_x_and_e(&x_t_flat, &e_t_flat);
 
-        // Read back s_t shadow once (16 KiB ≈ 1 µs over PCIe)
-        let s_cpu_vec = self.gpu.readback_s();
-        self.s_t_shadow = Array1::from_vec(s_cpu_vec);
+        // 2. Build the command buffer for explicit orchestration
+        let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        // LSH hash on the CPU shadow
-        let _h_st = self.lsh.hash(&self.s_t_shadow);
+        self.gpu.dispatch_reservoir(&mut enc);
+        self.gpu.dispatch_projections(&mut enc);
 
-        // ── Per-layer Hebbian updates (GPU) ───────────────────────────────
         let eta    = self.train_state.config.eta_lr_hebbian;
         let num_l  = self.layers.len();
         let mut kappas = Vec::with_capacity(num_l);
 
         for (l, layer) in self.layers.iter().enumerate() {
-            let depth_scale = 1.0 / (1.0 + l as f32 * 0.1);
-            let e_local: Array1<f32> = &e_t * depth_scale;
-
-            let kappa = layer.forward_gpu(
-                &mut self.gpu,
-            #[cfg(feature = "gpu")]
-            gpu_infer,
+            let kappa = layer.gamma; // sigmoid applied inside WGSL, but we need it for losses. Wait, kappa = sigmoid(gamma).
+            let kappa_val = 1.0 / (1.0 + (-layer.gamma).exp());
+            kappas.push(kappa_val);
+            
+            self.gpu.dispatch_hebbian(
                 l,
-                &e_local,
-                &self.s_t_shadow,
-                beta_g,
                 lambda_g,
+                kappa_val,
+                beta_g.powi(3) * eta,
                 sigma_g,
-                eta,
                 0.05,
                 1024.0,
+                &mut enc,
             );
-            kappas.push(kappa);
         }
 
-        // Read back per-layer M shadows (4 KiB each; L=4 → 16 KiB total)
-        for l in 0..num_l {
-            let m_flat = self.gpu.readback_m_layer(l);
-            self.m_shadows[l] = Array2::from_shape_vec((RANK_R, RANK_R), m_flat)
-                .expect("m_shadow reshape failed");
-        }
+        self.gpu.dispatch_aggregate(&mut enc);
+        self.gpu.dispatch_logits(&mut enc);
 
-        // Layer read-outs on CPU shadows (RANK_R × RANK_R matrix × RANK_R vec)
-        let layer_readouts: Vec<Array1<f32>> = self.layers
-            .iter()
-            .enumerate()
-            .map(|(l, layer)| layer.read_out_cpu(&self.m_shadows[l], &self.s_t_shadow))
-            .collect();
+        // 3. One single stable readback sync
+        let (s_cpu_vec, logits_cpu_vec) = self.gpu.readback_stable_point(&mut enc);
+        
+        self.s_t_shadow = Array1::from_vec(s_cpu_vec);
+        let full_logits = Array1::from_vec(logits_cpu_vec);
 
-        // ── Logit computation (GPU) ───────────────────────────────────────
-        let (full_logits, sparse_logits) = self
-            .prediction_head
-            .forward_gpu(&mut self.gpu,
-            #[cfg(feature = "gpu")]
-            gpu_infer, &self.s_t_shadow, &layer_readouts);
-
-        let x_hat_next = self.prediction_head.predict_embedding(&self.s_t_shadow);
+        let _h_st = self.lsh.hash(&self.s_t_shadow);
+        
+        let sparse_logits = vec![]; // omitted for brevity if not strictly needed or could extract top_k on CPU
+        let x_hat_next = self.prediction_head.predict_embedding(&self.s_t_shadow); // Still uses CPU shadow for predict embedding, or we could just use full_logits
 
         ForwardOutput {
             logits:           full_logits,

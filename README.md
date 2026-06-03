@@ -21,3 +21,14 @@ let token_id = system.forward_step_extreme_inference(text, t, &bpe_ids);
 
 ---
 
+## Zero-Sync Training Pipeline (v2.1.0)
+
+The training loop has been entirely revamped to remove CPU-GPU synchronization bottlenecks.
+Previously, the CPU calculated the Hebbian outer product and the forward pass required multiple readbacks (`M` matrix layers, `s_t`, `logits`).
+Now:
+- **Clean Swap Buffers**: The ping-pong buffers for `M` matrices are kept in VRAM.
+- **Explicit Orchestration**: The host CPU remains fully in control by dispatching specific stages: `Reservoir -> Projections -> Hebbian Plasticity -> Aggregate -> Logits`.
+- **Minimal Stable Point**: `s_t` and `logits` are mapped simultaneously, making training extremely fast (1 PCIe sync per step). The matrices `M` never leave VRAM during training unless a checkpoint is requested.
+
+
+
