@@ -22,6 +22,131 @@ pub const fn align_up(x: usize, align: usize) -> usize {
 // ─────────────────────────────────────────────────────────────────────────────
 
 
+pub const ATTENTION_SHADER: &str = r#"
+fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
+    let vec = unpack2x16float(arr[i / 2u]);
+    if (i % 2u) == 1u { return vec.y; }
+    return vec.x;
+}
+
+const D_MODEL_C: u32 = 512u;
+const MAX_SEQ_LEN_C: u32 = 1024u;
+const HEADS_C: u32 = 8u;
+const HEAD_DIM_C: u32 = 64u; // 512 / 8
+
+@group(0) @binding(0) var<storage, read> x_t: array<f32>;
+@group(0) @binding(1) var<storage, read> w_q: array<u32>;
+@group(0) @binding(2) var<storage, read> w_k: array<u32>;
+@group(0) @binding(3) var<storage, read> w_v: array<u32>;
+@group(0) @binding(4) var<storage, read> w_o: array<u32>;
+@group(0) @binding(5) var<storage, read_write> k_cache: array<f32>;
+@group(0) @binding(6) var<storage, read_write> v_cache: array<f32>;
+@group(0) @binding(7) var<storage, read_write> x_attn: array<f32>;
+
+struct AttnParams {
+    t: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(8) var<uniform> params: AttnParams;
+
+var<workgroup> q_shared: array<f32, 512>;
+var<workgroup> attn_scores: array<f32, 1024>; // MAX_SEQ_LEN
+var<workgroup> attn_out: array<f32, 512>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let b = gid.y;
+    
+    // 1. Compute Q, K, V for this token
+    for (var i = tid; i < D_MODEL_C; i += 64u) {
+        var q_val = 0.0;
+        var k_val = 0.0;
+        var v_val = 0.0;
+        for (var j = 0u; j < D_MODEL_C; j++) {
+            let x_val = x_t[b * D_MODEL_C + j];
+            q_val += x_val * get_f16(&w_q, i * D_MODEL_C + j);
+            k_val += x_val * get_f16(&w_k, i * D_MODEL_C + j);
+            v_val += x_val * get_f16(&w_v, i * D_MODEL_C + j);
+        }
+        q_shared[i] = q_val;
+        
+        let t_idx = params.t % MAX_SEQ_LEN_C;
+        let cache_idx = b * (MAX_SEQ_LEN_C * D_MODEL_C) + t_idx * D_MODEL_C + i;
+        k_cache[cache_idx] = k_val;
+        v_cache[cache_idx] = v_val;
+    }
+    workgroupBarrier();
+    
+    // 2. Compute Attention Scores for each head
+    let valid_history = select(params.t + 1u, MAX_SEQ_LEN_C, params.t >= MAX_SEQ_LEN_C);
+    
+    for (var h = 0u; h < HEADS_C; h++) {
+        // Compute dots (q * K^T)
+        for (var t_hist = tid; t_hist < valid_history; t_hist += 64u) {
+            var score = 0.0;
+            let cache_base = b * (MAX_SEQ_LEN_C * D_MODEL_C) + t_hist * D_MODEL_C + h * HEAD_DIM_C;
+            for (var d = 0u; d < HEAD_DIM_C; d++) {
+                score += q_shared[h * HEAD_DIM_C + d] * k_cache[cache_base + d];
+            }
+            // Scale
+            score = score * 0.125; // 1 / sqrt(64)
+            attn_scores[t_hist] = score;
+        }
+        workgroupBarrier();
+        
+        // Softmax per head (simplified max subtraction for stability)
+        var max_score = -99999.0;
+        for (var t_hist = 0u; t_hist < valid_history; t_hist++) {
+            if attn_scores[t_hist] > max_score {
+                max_score = attn_scores[t_hist];
+            }
+        }
+        var sum_exp = 0.0;
+        for (var t_hist = tid; t_hist < valid_history; t_hist += 64u) {
+            let e = exp(attn_scores[t_hist] - max_score);
+            attn_scores[t_hist] = e;
+        }
+        workgroupBarrier();
+        
+        // Tree reduce sum_exp ? For simplicity, single thread sums it up
+        if tid == 0u {
+            var s = 0.0;
+            for (var t_hist = 0u; t_hist < valid_history; t_hist++) {
+                s += attn_scores[t_hist];
+            }
+            for (var t_hist = 0u; t_hist < valid_history; t_hist++) {
+                attn_scores[t_hist] /= s;
+            }
+        }
+        workgroupBarrier();
+        
+        // Compute Out = Softmax * V
+        for (var d = tid; d < HEAD_DIM_C; d += 64u) {
+            var out_val = 0.0;
+            for (var t_hist = 0u; t_hist < valid_history; t_hist++) {
+                let cache_base = b * (MAX_SEQ_LEN_C * D_MODEL_C) + t_hist * D_MODEL_C + h * HEAD_DIM_C;
+                out_val += attn_scores[t_hist] * v_cache[cache_base + d];
+            }
+            attn_out[h * HEAD_DIM_C + d] = out_val;
+        }
+        workgroupBarrier();
+    }
+    
+    // 3. Final projection W_o
+    for (var i = tid; i < D_MODEL_C; i += 64u) {
+        var o_val = 0.0;
+        for (var j = 0u; j < D_MODEL_C; j++) {
+            o_val += attn_out[j] * get_f16(&w_o, i * D_MODEL_C + j);
+        }
+        // Residual connection: Attention + Original x_t
+        x_attn[b * D_MODEL_C + i] = x_t[b * D_MODEL_C + i] + o_val;
+    }
+}
+"#;
+
 pub const ENCODER_SHADER: &str = r#"
 
 
@@ -185,7 +310,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc_w: f32 = 0.0;
     let row_w: u32 = i * D_MODEL_C;
     for (var m = 0u; m < D_MODEL_C; m++) {
-        acc_w += get_f16(&w_in, row_w + m) * x_t[b * D_MODEL_C + m];
+        acc_w += get_f16(&w_in, row_w + m) * x_attn[b * D_MODEL_C + m];
     }
     s_out[b * N_RES_C + i] = tanh(acc_r + acc_w);
 }
@@ -408,6 +533,14 @@ pub struct GpuInferenceContext {
     pub phrase_window: usize,
     buf_r: wgpu::Buffer,
     buf_w_in: wgpu::Buffer,
+    buf_w_q: wgpu::Buffer,
+    buf_w_k: wgpu::Buffer,
+    buf_w_v: wgpu::Buffer,
+    buf_w_o: wgpu::Buffer,
+    buf_k_cache: wgpu::Buffer,
+    buf_v_cache: wgpu::Buffer,
+    buf_x_attn: wgpu::Buffer,
+    buf_attn_params: wgpu::Buffer,
     buf_s: [wgpu::Buffer; 2],
     pub s_ping: usize,
 
@@ -454,6 +587,10 @@ impl GpuInferenceContext {
         num_layers: usize,
         r_matrix_data: &[f32],
         w_in_data: &[f32],
+        w_q_data: &[f32],
+        w_k_data: &[f32],
+        w_v_data: &[f32],
+        w_o_data: &[f32],
         out_emb_data: &[f32],
         out_bias_data: &[f32],
         w_up_all_data: &[f32],
@@ -482,6 +619,7 @@ impl GpuInferenceContext {
             label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()),
         });
         
+        let attn_mod = create_shader(ATTENTION_SHADER, "attn_mod");
         let enc_mod = create_shader(ENCODER_SHADER, "enc_mod");
         let res_mod = create_shader(RESERVOIR_SHADER, "res_mod");
         let proj_mod = create_shader(PROJECTIONS_SHADER, "proj_mod");
@@ -505,6 +643,7 @@ impl GpuInferenceContext {
             count: None,
         };
 
+        let attn_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), ro(3), ro(4), rw(5), rw(6), rw(7), uni(8)] });
         let enc_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), ro(4)] });
         let res_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), ro(3), rw(4)] });
         let proj_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), rw(4), uni(5)] });
@@ -517,6 +656,7 @@ impl GpuInferenceContext {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&layout), module: m, entry_point: "main", compilation_options: Default::default(), cache: None })
         };
 
+        let attn_pl = make_pl(&attn_mod, &attn_bgl);
         let enc_pl = make_pl(&enc_mod, &enc_bgl);
         let res_pl = make_pl(&res_mod, &res_bgl);
         let proj_pl = make_pl(&proj_mod, &proj_bgl);
@@ -535,6 +675,15 @@ impl GpuInferenceContext {
         let buf_encoder_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("enc_p"), size: (max_batch_size * 64) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let buf_r = upload_u32(&pack_f32_to_f16(r_matrix_data), "r");
         let buf_w_in = upload_u32(&pack_f32_to_f16(w_in_data), "w_in");
+        let buf_w_q = upload_u32(&pack_f32_to_f16(w_q_data), "w_q");
+        let buf_w_k = upload_u32(&pack_f32_to_f16(w_k_data), "w_k");
+        let buf_w_v = upload_u32(&pack_f32_to_f16(w_v_data), "w_v");
+        let buf_w_o = upload_u32(&pack_f32_to_f16(w_o_data), "w_o");
+        let buf_k_cache = empty(max_batch_size * 1024 * D_MODEL, "k_cache");
+        let buf_v_cache = empty(max_batch_size * 1024 * D_MODEL, "v_cache");
+        let buf_x_attn = empty(max_batch_size * D_MODEL, "x_attn");
+        let buf_attn_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("attn_params"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    
         let buf_s = [empty(max_batch_size * N_RES, "s0"), empty(max_batch_size * N_RES, "s1")];
         let buf_x_t = empty(max_batch_size * D_MODEL, "x_t");
         let buf_y_hidden = empty(max_batch_size * D_MODEL, "y");
@@ -565,10 +714,10 @@ impl GpuInferenceContext {
         let top_k_size = 50;
 
         GpuInferenceContext {
-            device, queue, enc_pl, res_pl, proj_pl, agg_pl, log_pl, samp_pl,
-            enc_bgl, res_bgl, proj_bgl, agg_bgl, log_bgl, samp_bgl,
+            device, queue, attn_pl, res_pl, proj_pl, agg_pl, log_pl, samp_pl,
+            attn_bgl, res_bgl, proj_bgl, agg_bgl, log_bgl, samp_bgl,
             buf_bpe_embeddings, buf_w_fusion, buf_w_phrase, buf_encoder_params, phrase_window,
-            buf_r, buf_w_in, buf_s, s_ping: 0, buf_x_t, buf_y_hidden, buf_prev_pred,
+            buf_r, buf_w_in, buf_w_q, buf_w_k, buf_w_v, buf_w_o, buf_k_cache, buf_v_cache, buf_x_attn, buf_attn_params, buf_s, s_ping: 0, buf_x_t, buf_y_hidden, buf_prev_pred,
             buf_w_up_all, buf_w_out, buf_m_all, m_ping: 0, buf_local_s_all, buf_ro_all, buf_num_layers,
             max_batch_size,
             buf_out_emb, buf_out_bias, buf_logits, buf_top_k_tokens, buf_top_k_probs, buf_top_k_tokens_readback, buf_top_k_probs_readback, top_k_size,
@@ -617,7 +766,7 @@ impl GpuInferenceContext {
 
         // 0. Encoder
         let bg_enc = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None, layout: &self.enc_bgl,
+            label: None, layout: &self.attn_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.buf_bpe_embeddings.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.buf_w_fusion.as_entire_binding() },
@@ -635,6 +784,25 @@ impl GpuInferenceContext {
         // 1. Reservoir
         let prev_s = self.s_ping;
         let next_s = 1 - prev_s;
+        
+        let params_attn = [t_batch[0] as u32, 0, 0, 0];
+        self.queue.write_buffer(&self.buf_attn_params, 0, bytemuck::cast_slice(&params_attn));
+
+        let bg_attn = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.attn_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.buf_x_t.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.buf_w_q.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.buf_w_k.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.buf_w_v.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.buf_w_o.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.buf_k_cache.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.buf_v_cache.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.buf_x_attn.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.buf_attn_params.as_entire_binding() },
+            ],
+        });
+
         let bg_res = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None, layout: &self.res_bgl,
             entries: &[
@@ -647,7 +815,12 @@ impl GpuInferenceContext {
         });
         {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            cp.set_pipeline(&self.res_pl); cp.set_bind_group(0, &bg_res, &[]);
+            
+        cp.set_pipeline(&self.attn_pl);
+        cp.set_bind_group(0, &bg_attn, &[]);
+        cp.dispatch_workgroups(1, b as u32, 1);
+
+        cp.set_pipeline(&self.res_pl); cp.set_bind_group(0, &bg_res, &[]);
             cp.dispatch_workgroups((N_RES as u32 + 63) / 64, b as u32, 1);
         }
         self.s_ping = next_s;

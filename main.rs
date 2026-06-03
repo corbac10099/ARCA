@@ -188,11 +188,20 @@ impl ArcaSystem {
             let w_fusion_flat: Vec<f32> = encoder.w_fusion.iter().cloned().collect();
             let w_phrase_flat: Vec<f32> = encoder.w_phrase.iter().cloned().collect();
             let phrase_window = encoder.w_phrase.shape()[1] / encoder::D_BPE;
+            let mut rng = rand::thread_rng();
+            let w_q_data: Vec<f32> = (0..D_MODEL * D_MODEL).map(|_| rand::Rng::gen_range(&mut rng, -0.05..0.05)).collect();
+            let w_k_data: Vec<f32> = (0..D_MODEL * D_MODEL).map(|_| rand::Rng::gen_range(&mut rng, -0.05..0.05)).collect();
+            let w_v_data: Vec<f32> = (0..D_MODEL * D_MODEL).map(|_| rand::Rng::gen_range(&mut rng, -0.05..0.05)).collect();
+            let w_o_data: Vec<f32> = (0..D_MODEL * D_MODEL).map(|_| rand::Rng::gen_range(&mut rng, -0.05..0.05)).collect();
 
             gpu_inference_context::GpuInferenceContext::new(
                 num_l,
                 &r_flat,
                 &w_in_flat,
+                &w_q_data,
+                &w_k_data,
+                &w_v_data,
+                &w_o_data,
                 &out_emb_flat,
                 &out_bias_flat,
                 &w_up_all,
@@ -321,11 +330,20 @@ impl ArcaSystem {
             let w_fusion_flat: Vec<f32> = encoder.w_fusion.iter().cloned().collect();
             let w_phrase_flat: Vec<f32> = encoder.w_phrase.iter().cloned().collect();
             let phrase_window = encoder.w_phrase.shape()[1] / encoder::D_BPE;
+            let mut rng = rand::thread_rng();
+            let w_q_data: Vec<f32> = (0..D_MODEL * D_MODEL).map(|_| rand::Rng::gen_range(&mut rng, -0.05..0.05)).collect();
+            let w_k_data: Vec<f32> = (0..D_MODEL * D_MODEL).map(|_| rand::Rng::gen_range(&mut rng, -0.05..0.05)).collect();
+            let w_v_data: Vec<f32> = (0..D_MODEL * D_MODEL).map(|_| rand::Rng::gen_range(&mut rng, -0.05..0.05)).collect();
+            let w_o_data: Vec<f32> = (0..D_MODEL * D_MODEL).map(|_| rand::Rng::gen_range(&mut rng, -0.05..0.05)).collect();
 
             gpu_inference_context::GpuInferenceContext::new(
                 num_l,
                 &r_flat,
                 &w_in_flat,
+                &w_q_data,
+                &w_k_data,
+                &w_v_data,
+                &w_o_data,
                 &out_emb_flat,
                 &out_bias_flat,
                 &w_up_all,
