@@ -23,8 +23,8 @@ pub const fn align_up(x: usize, align: usize) -> usize {
 
 
 pub const ATTENTION_SHADER: &str = r#"
-fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float((*arr)[i / 2u]);
+fn get_f16_val(packed: u32, i: u32) -> f32 {
+    let vec = unpack2x16float(packed);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -67,9 +67,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         var v_val = 0.0;
         for (var j = 0u; j < D_MODEL_C; j++) {
             let x_val = x_t[b * D_MODEL_C + j];
-            q_val += x_val * get_f16(&w_q, i * D_MODEL_C + j);
-            k_val += x_val * get_f16(&w_k, i * D_MODEL_C + j);
-            v_val += x_val * get_f16(&w_v, i * D_MODEL_C + j);
+            q_val += x_val * get_f16_val(w_q[(i * D_MODEL_C + j) / 2u], i * D_MODEL_C + j);
+            k_val += x_val * get_f16_val(w_k[(i * D_MODEL_C + j) / 2u], i * D_MODEL_C + j);
+            v_val += x_val * get_f16_val(w_v[(i * D_MODEL_C + j) / 2u], i * D_MODEL_C + j);
         }
         q_shared[i] = q_val;
         
@@ -139,7 +139,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     for (var i = tid; i < D_MODEL_C; i += 64u) {
         var o_val = 0.0;
         for (var j = 0u; j < D_MODEL_C; j++) {
-            o_val += attn_out[j] * get_f16(&w_o, i * D_MODEL_C + j);
+            o_val += attn_out[j] * get_f16_val(w_o[(i * D_MODEL_C + j) / 2u], i * D_MODEL_C + j);
         }
         // Residual connection: Attention + Original x_t
         x_attn[b * D_MODEL_C + i] = x_t[b * D_MODEL_C + i] + o_val;
@@ -175,8 +175,8 @@ struct BatchInput {
 @group(0) @binding(4) var<storage, read> batch_inputs: array<BatchInput>;
 
 
-fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float((*arr)[i / 2u]);
+fn get_f16_val(packed: u32, i: u32) -> f32 {
+    let vec = unpack2x16float(packed);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -238,7 +238,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         let base_concat = 128u;
         for (var k = 0u; k < 4u; k++) {
             let offset = tid * 4u + k;
-            concat[base_concat + offset] = get_f16(&bpe_embeddings, id * 256u + offset);
+            concat[base_concat + offset] = get_f16_val(bpe_embeddings[(id * 256u + offset) / 2u], id * 256u + offset);
         }
     }
 
@@ -256,7 +256,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
                     let emb_base = bpe_id * 256u;
                     let w_base = row * win * 256u + k * 256u;
                     for (var e = 0u; e < 256u; e++) {
-                        dot += get_f16(&w_phrase, w_base + e) * get_f16(&bpe_embeddings, emb_base + e);
+                        dot += get_f16_val(w_phrase[(w_base + e) / 2u], w_base + e) * get_f16_val(bpe_embeddings[(emb_base + e) / 2u], emb_base + e);
                     }
                 }
             }
@@ -271,7 +271,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         var dot = 0.0;
         let w_base = row * 512u;
         for (var c = 0u; c < 512u; c++) {
-            dot += get_f16(&w_fusion, w_base + c) * concat[c];
+            dot += get_f16_val(w_fusion[(w_base + c) / 2u], w_base + c) * concat[c];
         }
         x_t_out[b * 512u + row] = dot;
     }
@@ -286,8 +286,8 @@ pub const RESERVOIR_SHADER: &str = r#"
 @group(0) @binding(4) var<storage, read_write> s_out    : array<f32>;
 
 
-fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float((*arr)[i / 2u]);
+fn get_f16_val(packed: u32, i: u32) -> f32 {
+    let vec = unpack2x16float(packed);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -304,13 +304,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc_r: f32 = 0.0;
     let row_r: u32 = i * N_RES_C;
     for (var k = 0u; k < N_RES_C; k++) {
-        acc_r += get_f16(&r_matrix, row_r + k) * s_prev[b * N_RES_C + k];
+        acc_r += get_f16_val(r_matrix[(row_r + k) / 2u], row_r + k) * s_prev[b * N_RES_C + k];
     }
 
     var acc_w: f32 = 0.0;
     let row_w: u32 = i * D_MODEL_C;
     for (var m = 0u; m < D_MODEL_C; m++) {
-        acc_w += get_f16(&w_in, row_w + m) * x_attn[b * D_MODEL_C + m];
+        acc_w += get_f16_val(w_in[(row_w + m) / 2u], row_w + m) * x_attn[b * D_MODEL_C + m];
     }
     s_out[b * N_RES_C + i] = tanh(acc_r + acc_w);
 }
@@ -326,8 +326,8 @@ pub const PROJECTIONS_SHADER: &str = r#"
 @group(0) @binding(5) var<uniform> num_layers: u32;
 
 
-fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float((*arr)[i / 2u]);
+fn get_f16_val(packed: u32, i: u32) -> f32 {
+    let vec = unpack2x16float(packed);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -347,7 +347,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wi
     var dot_s = 0.0;
     let w_up_offset = (l * RANK_R_C + i) * N_RES_C;
     for (var k = 0u; k < N_RES_C; k++) {
-        dot_s += get_f16(&w_up_all, w_up_offset + k) * s_t[b * N_RES_C + k];
+        dot_s += get_f16_val(w_up_all[(w_up_offset + k) / 2u], w_up_offset + k) * s_t[b * N_RES_C + k];
     }
     shared_local_s[i] = dot_s;
     local_s_all[b * (num_layers * RANK_R_C) + l * RANK_R_C + i] = dot_s;
@@ -357,7 +357,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wi
     var dot_ro = 0.0;
     let m_offset = (l * RANK_R_C + i) * RANK_R_C;
     for (var j = 0u; j < RANK_R_C; j++) {
-        dot_ro += get_f16(&m_all, m_offset + j) * shared_local_s[j];
+        dot_ro += get_f16_val(m_all[(m_offset + j) / 2u], m_offset + j) * shared_local_s[j];
     }
     ro_all[b * (num_layers * RANK_R_C) + l * RANK_R_C + i] = dot_ro;
 }
@@ -372,8 +372,8 @@ pub const AGGREGATE_SHADER: &str = r#"
 @group(0) @binding(5) var<uniform> num_layers: u32;
 
 
-fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float((*arr)[i / 2u]);
+fn get_f16_val(packed: u32, i: u32) -> f32 {
+    let vec = unpack2x16float(packed);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -405,7 +405,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if k < RANK_R_C {
             s_val += mod_sums[k];
         }
-        dot += get_f16(&w_out, w_out_offset + k) * s_val;
+        dot += get_f16_val(w_out[(w_out_offset + k) / 2u], w_out_offset + k) * s_val;
     }
     y_hidden[b * D_MODEL_C + j] = dot;
     prev_prediction[b * D_MODEL_C + j] = dot;
@@ -419,8 +419,8 @@ pub const LOGIT_SHADER: &str = r#"
 @group(0) @binding(3) var<storage, read_write> logits_out        : array<f32>;
 
 
-fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float((*arr)[i / 2u]);
+fn get_f16_val(packed: u32, i: u32) -> f32 {
+    let vec = unpack2x16float(packed);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -437,9 +437,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var dot: f32 = 0.0;
     let row_base: u32 = v * D_MODEL_C;
     for (var k = 0u; k < D_MODEL_C; k++) {
-        dot += get_f16(&output_embeddings, row_base + k) * y_hidden[b * D_MODEL_C + k];
+        dot += get_f16_val(output_embeddings[(row_base + k) / 2u], row_base + k) * y_hidden[b * D_MODEL_C + k];
     }
-    logits_out[b * VOCAB_SIZE_C + v] = dot + get_f16(&output_bias, v);
+    logits_out[b * VOCAB_SIZE_C + v] = dot + get_f16_val(output_bias[(v) / 2u], v);
 }
 "#;
 
