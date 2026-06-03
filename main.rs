@@ -22,6 +22,8 @@ mod train;
 
 #[cfg(feature = "gpu")]
 mod gpu_context;
+#[cfg(feature = "gpu")]
+mod gpu_inference_context;
 
 use ndarray::{Array1, Array2};
 
@@ -54,6 +56,8 @@ pub struct ArcaSystem {
     // ── GPU fields (compiled only when `--features gpu`) ──────────────────
     #[cfg(feature = "gpu")]
     gpu:              gpu_context::GpuContext,
+    #[cfg(feature = "gpu")]
+    gpu_infer:        gpu_inference_context::GpuInferenceContext,
 
     /// CPU shadow of the GPU-resident reservoir state s_t.
     /// Updated once per step via a 16 KiB readback after `dispatch_reservoir`.
@@ -159,6 +163,27 @@ impl ArcaSystem {
             )
         };
 
+        
+        #[cfg(feature = "gpu")]
+        let gpu_infer = {
+            let mut w_up_all = vec![];
+            let mut m_base_all = vec![];
+            for l in &layers {
+                w_up_all.extend(l.w_up.iter().cloned());
+                m_base_all.extend(l.m_base.iter().cloned());
+            }
+            gpu_inference_context::GpuInferenceContext::new(
+                num_l,
+                &r_flat,
+                &w_in_flat,
+                &out_emb_flat,
+                &out_bias_flat,
+                &w_up_all,
+                &w_out_flat,
+                &m_base_all,
+            )
+        };
+
         Ok(ArcaSystem {
             encoder,
             reservoir,
@@ -173,6 +198,8 @@ impl ArcaSystem {
 
             #[cfg(feature = "gpu")]
             gpu,
+            #[cfg(feature = "gpu")]
+            gpu_infer,
             #[cfg(feature = "gpu")]
             s_t_shadow: Array1::zeros(N_RES),
             #[cfg(feature = "gpu")]
@@ -263,6 +290,8 @@ impl ArcaSystem {
             #[cfg(feature = "gpu")]
             gpu,
             #[cfg(feature = "gpu")]
+            gpu_infer,
+            #[cfg(feature = "gpu")]
             s_t_shadow: Array1::zeros(N_RES),
             #[cfg(feature = "gpu")]
             m_shadows: (0..num_l)
@@ -283,6 +312,22 @@ impl ArcaSystem {
     ///   - Download: s_t (16 KiB) + RANK_R² per layer (4 KiB) + logits (195 KiB)
     ///
     /// No full matrix transfer (R, W_in, embeddings) in the hot loop.
+    #[cfg(feature = "gpu")]
+    
+    /// Zero-Sync GPU inference step.
+    /// No readbacks, fully executed in VRAM.
+    #[cfg(feature = "gpu")]
+    pub fn forward_step_extreme_inference(
+        &mut self,
+        raw_bytes: &[u8],
+        t: usize,
+        bpe_ids: &[u32],
+    ) -> u32 {
+        let x_t = self.encoder.encode_position(raw_bytes, t, bpe_ids);
+        let x_t_flat: Vec<f32> = x_t.iter().cloned().collect();
+        self.gpu_infer.forward_inference(&x_t_flat)
+    }
+
     #[cfg(feature = "gpu")]
     pub fn forward_step(
         &mut self,
@@ -307,7 +352,9 @@ impl ArcaSystem {
         self.tension = tension_new;
 
         // ── Reservoir step (GPU) ──────────────────────────────────────────
-        self.reservoir.step_gpu(&mut self.gpu, &x_t);
+        self.reservoir.step_gpu(&mut self.gpu,
+            #[cfg(feature = "gpu")]
+            gpu_infer, &x_t);
 
         // Read back s_t shadow once (16 KiB ≈ 1 µs over PCIe)
         let s_cpu_vec = self.gpu.readback_s();
@@ -327,6 +374,8 @@ impl ArcaSystem {
 
             let kappa = layer.forward_gpu(
                 &mut self.gpu,
+            #[cfg(feature = "gpu")]
+            gpu_infer,
                 l,
                 &e_local,
                 &self.s_t_shadow,
@@ -357,7 +406,9 @@ impl ArcaSystem {
         // ── Logit computation (GPU) ───────────────────────────────────────
         let (full_logits, sparse_logits) = self
             .prediction_head
-            .forward_gpu(&mut self.gpu, &self.s_t_shadow, &layer_readouts);
+            .forward_gpu(&mut self.gpu,
+            #[cfg(feature = "gpu")]
+            gpu_infer, &self.s_t_shadow, &layer_readouts);
 
         let x_hat_next = self.prediction_head.predict_embedding(&self.s_t_shadow);
 
@@ -377,6 +428,22 @@ impl ArcaSystem {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[cfg(not(feature = "gpu"))]
+    
+    /// Zero-Sync GPU inference step.
+    /// No readbacks, fully executed in VRAM.
+    #[cfg(feature = "gpu")]
+    pub fn forward_step_extreme_inference(
+        &mut self,
+        raw_bytes: &[u8],
+        t: usize,
+        bpe_ids: &[u32],
+    ) -> u32 {
+        let x_t = self.encoder.encode_position(raw_bytes, t, bpe_ids);
+        let x_t_flat: Vec<f32> = x_t.iter().cloned().collect();
+        self.gpu_infer.forward_inference(&x_t_flat)
+    }
+
+    #[cfg(feature = "gpu")]
     pub fn forward_step(
         &mut self,
         raw_bytes:       &[u8],
