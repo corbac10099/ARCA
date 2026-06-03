@@ -24,7 +24,7 @@ pub const fn align_up(x: usize, align: usize) -> usize {
 
 pub const ATTENTION_SHADER: &str = r#"
 fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float(arr[i / 2u]);
+    let vec = unpack2x16float((*arr)[i / 2u]);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -176,7 +176,7 @@ struct BatchInput {
 
 
 fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float(arr[i / 2u]);
+    let vec = unpack2x16float((*arr)[i / 2u]);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -287,7 +287,7 @@ pub const RESERVOIR_SHADER: &str = r#"
 
 
 fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float(arr[i / 2u]);
+    let vec = unpack2x16float((*arr)[i / 2u]);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -327,7 +327,7 @@ pub const PROJECTIONS_SHADER: &str = r#"
 
 
 fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float(arr[i / 2u]);
+    let vec = unpack2x16float((*arr)[i / 2u]);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -373,7 +373,7 @@ pub const AGGREGATE_SHADER: &str = r#"
 
 
 fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float(arr[i / 2u]);
+    let vec = unpack2x16float((*arr)[i / 2u]);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
@@ -420,7 +420,7 @@ pub const LOGIT_SHADER: &str = r#"
 
 
 fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
-    let vec = unpack2x16float(arr[i / 2u]);
+    let vec = unpack2x16float((*arr)[i / 2u]);
     if (i % 2u) == 1u { return vec.y; }
     return vec.x;
 }
