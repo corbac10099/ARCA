@@ -43,11 +43,18 @@ struct EncoderParams {
     _pad1: u32,
 }
 
-@group(0) @binding(0) var<storage, read> bpe_embeddings: array<f32>;
-@group(0) @binding(1) var<storage, read> w_fusion: array<f32>;
-@group(0) @binding(2) var<storage, read> w_phrase: array<f32>;
+@group(0) @binding(0) var<storage, read> bpe_embeddings: array<u32>;
+@group(0) @binding(1) var<storage, read> w_fusion: array<u32>;
+@group(0) @binding(2) var<storage, read> w_phrase: array<u32>;
 @group(0) @binding(3) var<storage, read_write> x_t_out: array<f32>;
 @group(0) @binding(4) var<uniform> params: EncoderParams;
+
+
+fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
+    let vec = unpack2x16float(arr[i / 2u]);
+    if (i % 2u) == 1u { return vec.y; }
+    return vec.x;
+}
 
 const BPE_VOCAB_SIZE_C: u32 = 4096u;
 
@@ -104,7 +111,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let base_concat = 128u;
         for (var k = 0u; k < 4u; k++) {
             let offset = tid * 4u + k;
-            concat[base_concat + offset] = bpe_embeddings[id * 256u + offset];
+            concat[base_concat + offset] = get_f16(&bpe_embeddings, id * 256u + offset);
         }
     }
 
@@ -122,7 +129,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                     let emb_base = bpe_id * 256u;
                     let w_base = row * win * 256u + k * 256u;
                     for (var e = 0u; e < 256u; e++) {
-                        dot += w_phrase[w_base + e] * bpe_embeddings[emb_base + e];
+                        dot += get_f16(&w_phrase, w_base + e) * get_f16(&bpe_embeddings, emb_base + e);
                     }
                 }
             }
@@ -137,7 +144,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         var dot = 0.0;
         let w_base = row * 512u;
         for (var c = 0u; c < 512u; c++) {
-            dot += w_fusion[w_base + c] * concat[c];
+            dot += get_f16(&w_fusion, w_base + c) * concat[c];
         }
         x_t_out[row] = dot;
     }
@@ -145,11 +152,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 "#;
 
 pub const RESERVOIR_SHADER: &str = r#"
-@group(0) @binding(0) var<storage, read>       r_matrix : array<f32>;
-@group(0) @binding(1) var<storage, read>       w_in     : array<f32>;
+@group(0) @binding(0) var<storage, read>       r_matrix : array<u32>;
+@group(0) @binding(1) var<storage, read>       w_in     : array<u32>;
 @group(0) @binding(2) var<storage, read>       s_prev   : array<f32>;
 @group(0) @binding(3) var<storage, read>       x_t      : array<f32>;
 @group(0) @binding(4) var<storage, read_write> s_out    : array<f32>;
+
+
+fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
+    let vec = unpack2x16float(arr[i / 2u]);
+    if (i % 2u) == 1u { return vec.y; }
+    return vec.x;
+}
 
 const N_RES_C:   u32 = 4096u;
 const D_MODEL_C: u32 = 512u;
@@ -162,13 +176,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc_r: f32 = 0.0;
     let row_r: u32 = i * N_RES_C;
     for (var k = 0u; k < N_RES_C; k++) {
-        acc_r += r_matrix[row_r + k] * s_prev[k];
+        acc_r += get_f16(&r_matrix, row_r + k) * s_prev[k];
     }
 
     var acc_w: f32 = 0.0;
     let row_w: u32 = i * D_MODEL_C;
     for (var m = 0u; m < D_MODEL_C; m++) {
-        acc_w += w_in[row_w + m] * x_t[m];
+        acc_w += get_f16(&w_in, row_w + m) * x_t[m];
     }
     s_out[i] = tanh(acc_r + acc_w);
 }
@@ -177,11 +191,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 pub const PROJECTIONS_SHADER: &str = r#"
 // Computes local_s_l = W_up_l * s_t and ro_l = M_l * local_s_l
 @group(0) @binding(0) var<storage, read> s_t: array<f32>;
-@group(0) @binding(1) var<storage, read> w_up_all: array<f32>;
-@group(0) @binding(2) var<storage, read> m_all: array<f32>;
+@group(0) @binding(1) var<storage, read> w_up_all: array<u32>;
+@group(0) @binding(2) var<storage, read> m_all: array<u32>;
 @group(0) @binding(3) var<storage, read_write> local_s_all: array<f32>;
 @group(0) @binding(4) var<storage, read_write> ro_all: array<f32>;
 @group(0) @binding(5) var<uniform> num_layers: u32;
+
+
+fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
+    let vec = unpack2x16float(arr[i / 2u]);
+    if (i % 2u) == 1u { return vec.y; }
+    return vec.x;
+}
 
 const N_RES_C: u32 = 4096u;
 const RANK_R_C: u32 = 32u;
@@ -197,7 +218,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     var dot_s = 0.0;
     let w_up_offset = (l * RANK_R_C + i) * N_RES_C;
     for (var k = 0u; k < N_RES_C; k++) {
-        dot_s += w_up_all[w_up_offset + k] * s_t[k];
+        dot_s += get_f16(&w_up_all, w_up_offset + k) * s_t[k];
     }
     shared_local_s[i] = dot_s;
     local_s_all[l * RANK_R_C + i] = dot_s;
@@ -207,7 +228,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     var dot_ro = 0.0;
     let m_offset = (l * RANK_R_C + i) * RANK_R_C;
     for (var j = 0u; j < RANK_R_C; j++) {
-        dot_ro += m_all[m_offset + j] * shared_local_s[j];
+        dot_ro += get_f16(&m_all, m_offset + j) * shared_local_s[j];
     }
     ro_all[l * RANK_R_C + i] = dot_ro;
 }
@@ -216,10 +237,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 pub const AGGREGATE_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read> s_t: array<f32>;
 @group(0) @binding(1) var<storage, read> ro_all: array<f32>;
-@group(0) @binding(2) var<storage, read> w_out: array<f32>;
+@group(0) @binding(2) var<storage, read> w_out: array<u32>;
 @group(0) @binding(3) var<storage, read_write> y_hidden: array<f32>;
 @group(0) @binding(4) var<storage, read_write> prev_prediction: array<f32>;
 @group(0) @binding(5) var<uniform> num_layers: u32;
+
+
+fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
+    let vec = unpack2x16float(arr[i / 2u]);
+    if (i % 2u) == 1u { return vec.y; }
+    return vec.x;
+}
 
 const N_RES_C: u32 = 4096u;
 const RANK_R_C: u32 = 32u;
@@ -247,7 +275,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if k < RANK_R_C {
             s_val += mod_sums[k];
         }
-        dot += w_out[w_out_offset + k] * s_val;
+        dot += get_f16(&w_out, w_out_offset + k) * s_val;
     }
     y_hidden[j] = dot;
     prev_prediction[j] = dot;
@@ -255,10 +283,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 pub const LOGIT_SHADER: &str = r#"
-@group(0) @binding(0) var<storage, read>       output_embeddings : array<f32>;
-@group(0) @binding(1) var<storage, read>       output_bias       : array<f32>;
+@group(0) @binding(0) var<storage, read>       output_embeddings : array<u32>;
+@group(0) @binding(1) var<storage, read>       output_bias       : array<u32>;
 @group(0) @binding(2) var<storage, read>       y_hidden          : array<f32>;
 @group(0) @binding(3) var<storage, read_write> logits_out        : array<f32>;
+
+
+fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
+    let vec = unpack2x16float(arr[i / 2u]);
+    if (i % 2u) == 1u { return vec.y; }
+    return vec.x;
+}
 
 const VOCAB_SIZE_C: u32 = 50000u;
 const D_MODEL_C:    u32 = 512u;
@@ -271,9 +306,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var dot: f32 = 0.0;
     let row_base: u32 = v * D_MODEL_C;
     for (var k = 0u; k < D_MODEL_C; k++) {
-        dot += output_embeddings[row_base + k] * y_hidden[k];
+        dot += get_f16(&output_embeddings, row_base + k) * y_hidden[k];
     }
-    logits_out[v] = dot + output_bias[v];
+    logits_out[v] = dot + get_f16(&output_bias, v);
 }
 "#;
 
@@ -395,6 +430,17 @@ pub struct GpuInferenceContext {
     num_layers: usize,
 }
 
+
+fn pack_f32_to_f16(data: &[f32]) -> Vec<u32> {
+    let mut packed = Vec::with_capacity((data.len() + 1) / 2);
+    for chunk in data.chunks(2) {
+        let h0 = half::f16::from_f32(chunk[0]).to_bits() as u32;
+        let h1 = if chunk.len() > 1 { half::f16::from_f32(chunk[1]).to_bits() as u32 } else { 0 };
+        packed.push(h0 | (h1 << 16));
+    }
+    packed
+}
+
 impl GpuInferenceContext {
     pub fn new(
         num_layers: usize,
@@ -471,24 +517,26 @@ impl GpuInferenceContext {
         let samp_pl = make_pl(&samp_mod, &samp_bgl);
 
         let upload = |data: &[f32], lbl: &str| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(lbl), contents: bytemuck::cast_slice(data), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC });
+        let upload_u32 = |data: &[u32], lbl: &str| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(lbl), contents: bytemuck::cast_slice(data), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC });
         let empty = |n: usize, lbl: &str| device.create_buffer(&wgpu::BufferDescriptor { label: Some(lbl), size: (n*4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         let readback = |n: usize, lbl: &str| device.create_buffer(&wgpu::BufferDescriptor { label: Some(lbl), size: (n*4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
-        let buf_bpe_embeddings = upload(bpe_embeddings_data, "bpe_emb");
-        let buf_w_fusion = upload(w_fusion_data, "w_fus");
-        let buf_w_phrase = upload(w_phrase_data, "w_phr");
+        let buf_bpe_embeddings = upload_u32(&pack_f32_to_f16(bpe_embeddings_data), "bpe_emb");
+        let buf_w_fusion = upload_u32(&pack_f32_to_f16(w_fusion_data), "w_fus");
+        let buf_w_phrase = upload_u32(&pack_f32_to_f16(w_phrase_data), "w_phr");
         let buf_encoder_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("enc_p"), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let buf_r = upload(r_matrix_data, "r");
-        let buf_w_in = upload(w_in_data, "w_in");
+        let buf_r = upload_u32(&pack_f32_to_f16(r_matrix_data), "r");
+        let buf_w_in = upload_u32(&pack_f32_to_f16(w_in_data), "w_in");
         let buf_s = [empty(N_RES, "s0"), empty(N_RES, "s1")];
         let buf_x_t = empty(D_MODEL, "x_t");
         let buf_y_hidden = empty(D_MODEL, "y");
         let buf_prev_pred = empty(D_MODEL, "prev");
         
-        let buf_w_up_all = upload(w_up_all_data, "w_up_all");
-        let buf_w_out = upload(w_out_data, "w_out");
+        let buf_w_up_all = upload_u32(&pack_f32_to_f16(w_up_all_data), "w_up_all");
+        let buf_w_out = upload_u32(&pack_f32_to_f16(w_out_data), "w_out");
         
-        let buf_m_all = [upload(m_base_all_data, "m0"), upload(m_base_all_data, "m1")];
+        let packed_m = pack_f32_to_f16(m_base_all_data);
+        let buf_m_all = [upload_u32(&packed_m, "m0"), upload_u32(&packed_m, "m1")];
         
         let buf_local_s_all = empty(num_layers * RANK_R, "loc_s");
         let buf_ro_all = empty(num_layers * RANK_R, "ro");
@@ -499,8 +547,8 @@ impl GpuInferenceContext {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let buf_out_emb = upload(out_emb_data, "emb");
-        let buf_out_bias = upload(out_bias_data, "bias");
+        let buf_out_emb = upload_u32(&pack_f32_to_f16(out_emb_data), "emb");
+        let buf_out_bias = upload_u32(&pack_f32_to_f16(out_bias_data), "bias");
         let buf_logits = empty(VOCAB_SIZE, "log");
         let buf_top_k_tokens = empty(50, "token_k");
         let buf_top_k_probs = empty(50, "prob_k");
