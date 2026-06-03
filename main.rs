@@ -183,6 +183,12 @@ impl ArcaSystem {
                 w_up_all.extend(l.w_up.iter().cloned());
                 m_base_all.extend(l.m_base.iter().cloned());
             }
+            
+            let bpe_emb_flat: Vec<f32> = encoder.bpe_embeddings.iter().cloned().collect();
+            let w_fusion_flat: Vec<f32> = encoder.w_fusion.iter().cloned().collect();
+            let w_phrase_flat: Vec<f32> = encoder.w_phrase.iter().cloned().collect();
+            let phrase_window = encoder.w_phrase.shape()[1] / encoder::D_BPE;
+
             gpu_inference_context::GpuInferenceContext::new(
                 num_l,
                 &r_flat,
@@ -192,6 +198,10 @@ impl ArcaSystem {
                 &w_up_all,
                 &w_out_flat,
                 &m_base_all,
+                &bpe_emb_flat,
+                &w_fusion_flat,
+                &w_phrase_flat,
+                phrase_window,
             )
         };
 
@@ -297,6 +307,36 @@ impl ArcaSystem {
             )
         };
 
+        #[cfg(feature = "gpu")]
+        let gpu_infer = {
+            let mut w_up_all = vec![];
+            let mut m_base_all = vec![];
+            for l in &layers {
+                w_up_all.extend(l.w_up.iter().cloned());
+                m_base_all.extend(l.m_base.iter().cloned());
+            }
+            
+            let bpe_emb_flat: Vec<f32> = encoder.bpe_embeddings.iter().cloned().collect();
+            let w_fusion_flat: Vec<f32> = encoder.w_fusion.iter().cloned().collect();
+            let w_phrase_flat: Vec<f32> = encoder.w_phrase.iter().cloned().collect();
+            let phrase_window = encoder.w_phrase.shape()[1] / encoder::D_BPE;
+
+            gpu_inference_context::GpuInferenceContext::new(
+                num_l,
+                &r_flat,
+                &w_in_flat,
+                &out_emb_flat,
+                &out_bias_flat,
+                &w_up_all,
+                &w_out_flat,
+                &m_base_all,
+                &bpe_emb_flat,
+                &w_fusion_flat,
+                &w_phrase_flat,
+                phrase_window,
+            )
+        };
+
         ArcaSystem {
             encoder,
             reservoir,
@@ -336,18 +376,48 @@ impl ArcaSystem {
     /// No full matrix transfer (R, W_in, embeddings) in the hot loop.
     #[cfg(feature = "gpu")]
     
-    /// Zero-Sync GPU inference step.
-    /// No readbacks, fully executed in VRAM.
+    /// Zero-Sync GPU inference step (Phase 2: Top-K Sampling).
+    /// Retrieves Top-K tokens and their logits from VRAM, applies temperature,
+    /// and performs a weighted random choice.
     #[cfg(feature = "gpu")]
     pub fn forward_step_extreme_inference(
         &mut self,
         raw_bytes: &[u8],
         t: usize,
         bpe_ids: &[u32],
+        temperature: f32,
     ) -> u32 {
-        let x_t = self.encoder.encode_position(raw_bytes, t, bpe_ids);
-        let x_t_flat: Vec<f32> = x_t.iter().cloned().collect();
-        self.gpu_infer.forward_inference(&x_t_flat)
+        let (top_k_tokens, top_k_logits) = self.gpu_infer.forward_inference(raw_bytes, t, bpe_ids);
+        
+        if temperature <= 1e-5 {
+            // Greedy fallback
+            return top_k_tokens[0];
+        }
+
+        // Apply temperature and softmax
+        let max_logit = top_k_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut exps = Vec::with_capacity(top_k_logits.len());
+        let mut sum_exp = 0.0;
+        
+        for &l in &top_k_logits {
+            let e = ((l - max_logit) / temperature).exp();
+            exps.push(e);
+            sum_exp += e;
+        }
+
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let target = rng.gen_range(0.0..sum_exp);
+        
+        let mut acc = 0.0;
+        for (i, &e) in exps.iter().enumerate() {
+            acc += e;
+            if acc >= target {
+                return top_k_tokens[i];
+            }
+        }
+        
+        top_k_tokens[top_k_tokens.len() - 1]
     }
 
     #[cfg(feature = "gpu")]
