@@ -1033,6 +1033,12 @@ pub struct ArcaModel {
 #[cfg(feature = "gpu")]
 #[pymethods]
 impl ArcaModel {
+    #[staticmethod]
+    fn create(sovereign_path: &str, tokenizer_path: &str) -> PyResult<()> {
+        run_init(sovereign_path, tokenizer_path);
+        Ok(())
+    }
+
     #[new]
     fn new(sovereign_path: &str, tokenizer_path: &str) -> PyResult<Self> {
         let model = SovereignModel::load_from_file(sovereign_path)
@@ -1112,6 +1118,49 @@ impl ArcaModel {
 
         let gen_bytes = self.tokenizer.decode(&generated_ids);
         String::from_utf8_lossy(&gen_bytes).into_owned()
+    }
+
+    fn train(&mut self, corpus: &str, save_path: &str, window_size: usize) -> PyResult<()> {
+        let bytes = corpus.as_bytes();
+        let bpe_ids = self.tokenizer.encode_aligned(bytes);
+        let batches = build_batches(bytes, &bpe_ids, window_size);
+        
+        eprintln!("[ARCA] Training on {} batches of {} bytes.", batches.len(), window_size);
+        self.system.reset_state();
+        
+        // Since we don't store header, we construct a default one matching the random init
+        // In a full implementation, we'd persist the original header on ArcaSystem
+        let header = SovereignHeader::default();
+        let mut global_step = 0usize;
+        let mut total_loss = 0.0_f32;
+
+        for (batch_idx, batch) in batches.iter().enumerate() {
+            let b_bytes = &batch.bytes;
+            let ids   = &batch.bpe_ids;
+            let mut prev_pred: Option<Array1<f32>> = None;
+
+            for t in 0..b_bytes.len().saturating_sub(1) {
+                let output = self.system.forward_step(b_bytes, t, ids, prev_pred.as_ref());
+                let target = b_bytes[t + 1] as usize % VOCAB_SIZE;
+                let losses = self.system.backward_step(&output, target);
+                
+                if global_step % 100 == 0 {
+                    eprintln!("[batch {:>3} step {:>4}] loss={:.4}", batch_idx, global_step, losses.total);
+                }
+                
+                total_loss += losses.total;
+                global_step += 1;
+                prev_pred = Some(output.next_prediction);
+            }
+            self.system.reset_state();
+        }
+
+        eprintln!("[ARCA] Training complete. Avg loss={:.4}", total_loss / global_step.max(1) as f32);
+
+        self.system.save_weights(&header, save_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to save model: {:?}", e)))?;
+
+        Ok(())
     }
 }
 

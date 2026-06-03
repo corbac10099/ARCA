@@ -1,6 +1,6 @@
 [package]
 name    = "arca"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [lib]
@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 # Feature flags
 # ─────────────────────────────────────────────────────────────────────────────
 [features]
-default = []
+default = ["gpu"]
 # Enable the full wgpu GPU pipeline.
 # Build: cargo build --release --features gpu
 # Test:  cargo test  --features gpu
