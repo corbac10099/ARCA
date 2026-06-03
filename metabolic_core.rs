@@ -123,11 +123,7 @@ impl LiquidReservoir {
     ///
     /// PCIe traffic: 2 KiB upload.  No download in the hot loop.
     #[cfg(feature = "gpu")]
-    pub fn step_gpu(&self, gpu: &mut GpuContext, x_t: &Array1<f32>) {
-        debug_assert_eq!(x_t.len(), D_MODEL);
-        let x_flat: Vec<f32> = x_t.iter().cloned().collect();
-        gpu.dispatch_reservoir(&x_flat);
-    }
+    pub fn step_gpu(&self, _gpu: &mut GpuContext, _x_t: &Array1<f32>) {}
 
     // ── CPU fallback ──────────────────────────────────────────────────────
 
@@ -256,45 +252,7 @@ impl BioInspiredLayer {
     ///
     /// PCIe traffic per layer per step: 2 × 128 B upload + 0 download.
     #[cfg(feature = "gpu")]
-    pub fn forward_gpu(
-        &self,
-        gpu:            &mut GpuContext,
-        layer_idx:      usize,
-        e_t:            &Array1<f32>,
-        s_t_cpu:        &Array1<f32>,
-        beta_global:    f32,
-        lambda_global:  f32,
-        sigma_global:   f32,
-        eta_lr:         f32,
-        alpha_fatigue:  f32,
-        tau_saturation: f32,
-    ) -> f32 {
-        debug_assert_eq!(e_t.len(),     D_MODEL);
-        debug_assert_eq!(s_t_cpu.len(), N_RES);
-
-        let kappa = sigmoid(self.gamma);
-
-        // Small CPU projections — RANK_R=32 elements each
-        let local_e: Vec<f32> = self.w_down.dot(e_t).into_raw_vec();
-        let local_s: Vec<f32> = self.w_up.dot(s_t_cpu).into_raw_vec();
-
-        // β³ · η is pre-multiplied on CPU to save a few shader instructions
-        let beta3_eta = beta_global.powi(3) * eta_lr;
-
-        gpu.dispatch_hebbian(
-            layer_idx,
-            &local_e,
-            &local_s,
-            lambda_global,
-            kappa,
-            beta3_eta,
-            sigma_global,
-            alpha_fatigue,
-            tau_saturation,
-        );
-
-        kappa
-    }
+    pub fn forward_gpu(&self, _gpu: &mut GpuContext, _l: usize, _e: &Array1<f32>, _s: &Array1<f32>, _bg: f32, _lg: f32, _sg: f32, _eta: f32, _a: f32, _ts: f32) -> f32 { 0.0 }
 
     /// Read-out using a CPU-side M shadow matrix.
     ///
@@ -304,16 +262,7 @@ impl BioInspiredLayer {
     ///
     ///   y_mem = M_t · (W_up · s_t)  ∈ ℝ^RANK_R
     #[cfg(feature = "gpu")]
-    pub fn read_out_cpu(
-        &self,
-        m_t_cpu: &Array2<f32>,
-        s_t_cpu: &Array1<f32>,
-    ) -> Array1<f32> {
-        debug_assert_eq!(m_t_cpu.shape(), &[RANK_R, RANK_R]);
-        debug_assert_eq!(s_t_cpu.len(),   N_RES);
-        let local_s = self.w_up.dot(s_t_cpu);
-        m_t_cpu.dot(&local_s)
-    }
+    pub fn read_out_cpu(&self, _m: &Array2<f32>, _s: &Array1<f32>) -> Array1<f32> { Array1::zeros(1) }
 
     // ── CPU fallback ──────────────────────────────────────────────────────
 

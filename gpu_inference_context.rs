@@ -511,6 +511,7 @@ pub struct GpuInferenceContext {
 
     // Pipelines
     enc_pl: wgpu::ComputePipeline,
+    pub attn_pl: wgpu::ComputePipeline,
     res_pl: wgpu::ComputePipeline,
     proj_pl: wgpu::ComputePipeline,
     agg_pl: wgpu::ComputePipeline,
@@ -519,6 +520,7 @@ pub struct GpuInferenceContext {
 
     // BGLs
     enc_bgl: wgpu::BindGroupLayout,
+    pub attn_bgl: wgpu::BindGroupLayout,
     res_bgl: wgpu::BindGroupLayout,
     proj_bgl: wgpu::BindGroupLayout,
     agg_bgl: wgpu::BindGroupLayout,
@@ -567,6 +569,7 @@ pub struct GpuInferenceContext {
     buf_top_k_probs_readback: wgpu::Buffer,
     pub top_k_size: usize,
     pub max_batch_size: usize,
+    pub buf_encoder_batch_inputs: Vec<wgpu::Buffer>,
     
     num_layers: usize,
 }
@@ -601,6 +604,7 @@ impl GpuInferenceContext {
         w_phrase_data: &[f32],
         phrase_window: usize,
     ) -> Self {
+        let max_batch_size = 32;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .expect("No adapter");
@@ -653,7 +657,7 @@ impl GpuInferenceContext {
 
         let make_pl = |m, bgl| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[bgl], push_constant_ranges: &[] });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&layout), module: m, entry_point: "main", compilation_options: Default::default(), cache: None })
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&layout), module: m, entry_point: "main", compilation_options: Default::default()  })
         };
 
         let attn_pl = make_pl(&attn_mod, &attn_bgl);
@@ -712,17 +716,18 @@ impl GpuInferenceContext {
         let buf_top_k_tokens_readback = readback(max_batch_size * 50, "token_k_rb");
         let buf_top_k_probs_readback = readback(max_batch_size * 50, "prob_k_rb");
         let top_k_size = 50;
+        let buf_encoder_batch_inputs = vec![empty(max_batch_size * 1024, "enc_b")];
 
         GpuInferenceContext {
-            device, queue, attn_pl, res_pl, proj_pl, agg_pl, log_pl, samp_pl,
-            attn_bgl, res_bgl, proj_bgl, agg_bgl, log_bgl, samp_bgl,
-            buf_bpe_embeddings, buf_w_fusion, buf_w_phrase, buf_encoder_params, phrase_window,
+            device, queue, enc_pl, attn_pl, res_pl, proj_pl, agg_pl, log_pl, samp_pl,
+            enc_bgl, attn_bgl, res_bgl, proj_bgl, agg_bgl, log_bgl, samp_bgl,
+            buf_bpe_embeddings, buf_w_fusion, buf_w_phrase, buf_encoder_params, phrase_window, buf_encoder_batch_inputs, 
             buf_r, buf_w_in, buf_w_q, buf_w_k, buf_w_v, buf_w_o, buf_k_cache, buf_v_cache, buf_x_attn, buf_attn_params, buf_s, s_ping: 0, buf_x_t, buf_y_hidden, buf_prev_pred,
             buf_w_up_all, buf_w_out, buf_m_all, m_ping: 0, buf_local_s_all, buf_ro_all, buf_num_layers,
             max_batch_size,
             buf_out_emb, buf_out_bias, buf_logits, buf_top_k_tokens, buf_top_k_probs, buf_top_k_tokens_readback, buf_top_k_probs_readback, top_k_size,
             num_layers,
-            max_batch_size,
+
         }
     }
 
@@ -778,7 +783,7 @@ impl GpuInferenceContext {
         {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             cp.set_pipeline(&self.enc_pl); cp.set_bind_group(0, &bg_enc, &[]);
-            cp.dispatch_workgroups(1, b as u32, 1); are enough to process x_t
+            cp.dispatch_workgroups(1, b as u32, 1); // are enough to process x_t
         }
 
         // 1. Reservoir

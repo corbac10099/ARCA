@@ -26,6 +26,7 @@ mod gpu_context;
 mod gpu_inference_context;
 
 use ndarray::{Array1, Array2};
+use pyo3::prelude::*;
 
 use encoder::{MultiScaleEncoder, BPE_VOCAB_SIZE, D_BPE, D_MODEL, D_PHRASE, PHRASE_WIN_MIN};
 use memory::{HolographicMemoryAggregator, PredictionHead, SparseOutputHead, VOCAB_SIZE};
@@ -127,6 +128,8 @@ impl ArcaSystem {
         // Output head
         let w_out      = model.tensor_as_array2("w_out")?;
         let aggregator = HolographicMemoryAggregator::new(w_out);
+        #[cfg(feature = "gpu")]
+        let w_out_flat: Vec<f32> = aggregator.w_out.iter().cloned().collect();
         let out_emb    = model.tensor_as_array2("output_embeddings")?;
         let out_bias   = model.tensor_as_array1("output_bias")?;
         let head       = SparseOutputHead::new(out_emb, out_bias);
@@ -139,15 +142,18 @@ impl ArcaSystem {
 
         // ── GPU context ───────────────────────────────────────────────────
         #[cfg(feature = "gpu")]
+        let r_flat: Vec<f32> = reservoir.r_matrix.iter().cloned().collect();
+        #[cfg(feature = "gpu")]
+        let w_in_flat: Vec<f32> = reservoir.w_in.iter().cloned().collect();
+        #[cfg(feature = "gpu")]
+        let out_emb_flat: Vec<f32> = prediction_head.head.output_embeddings.iter().cloned().collect();
+        #[cfg(feature = "gpu")]
+        let out_bias_flat: Vec<f32> = prediction_head.head.output_bias.iter().cloned().collect();
+
+        #[cfg(feature = "gpu")]
         let gpu = {
             use gpu_context::GpuContext;
 
-            let r_flat: Vec<f32> = reservoir.r_matrix.iter().cloned().collect();
-            let w_in_flat: Vec<f32> = reservoir.w_in.iter().cloned().collect();
-            let out_emb_flat: Vec<f32> =
-                prediction_head.head.output_embeddings.iter().cloned().collect();
-            let out_bias_flat: Vec<f32> =
-                prediction_head.head.output_bias.iter().cloned().collect();
             let m_base_data: Vec<Vec<f32>> = layers
                 .iter()
                 .map(|l| l.m_base.iter().cloned().collect())
@@ -159,7 +165,6 @@ impl ArcaSystem {
                 w_up_all.extend(l.w_up.iter().cloned());
                 w_down_all.extend(l.w_down.iter().cloned());
             }
-            let w_out_flat: Vec<f32> = aggregator.w_out.iter().cloned().collect();
 
             GpuContext::new(
                 num_l,
@@ -210,8 +215,7 @@ impl ArcaSystem {
                 &bpe_emb_flat,
                 &w_fusion_flat,
                 &w_phrase_flat,
-                phrase_window,
-                32, // max_batch_size
+                phrase_window
             )
         };
 
@@ -270,6 +274,8 @@ impl ArcaSystem {
             .collect();
 
         let aggregator  = HolographicMemoryAggregator::new(make_rand_2d(D_MODEL, N_RES));
+        #[cfg(feature = "gpu")]
+        let w_out_flat: Vec<f32> = aggregator.w_out.iter().cloned().collect();
         let head        = SparseOutputHead::new(
             make_rand_2d(VOCAB_SIZE, D_MODEL),
             make_rand_1d(VOCAB_SIZE),
@@ -282,15 +288,18 @@ impl ArcaSystem {
 
         // ── GPU context (random init) ─────────────────────────────────────
         #[cfg(feature = "gpu")]
+        let r_flat: Vec<f32> = reservoir.r_matrix.iter().cloned().collect();
+        #[cfg(feature = "gpu")]
+        let w_in_flat: Vec<f32> = reservoir.w_in.iter().cloned().collect();
+        #[cfg(feature = "gpu")]
+        let out_emb_flat: Vec<f32> = prediction_head.head.output_embeddings.iter().cloned().collect();
+        #[cfg(feature = "gpu")]
+        let out_bias_flat: Vec<f32> = prediction_head.head.output_bias.iter().cloned().collect();
+
+        #[cfg(feature = "gpu")]
         let gpu = {
             use gpu_context::GpuContext;
 
-            let r_flat: Vec<f32> = reservoir.r_matrix.iter().cloned().collect();
-            let w_in_flat: Vec<f32> = reservoir.w_in.iter().cloned().collect();
-            let out_emb_flat: Vec<f32> =
-                prediction_head.head.output_embeddings.iter().cloned().collect();
-            let out_bias_flat: Vec<f32> =
-                prediction_head.head.output_bias.iter().cloned().collect();
             let m_base_data: Vec<Vec<f32>> = layers
                 .iter()
                 .map(|l| l.m_base.iter().cloned().collect())
@@ -302,7 +311,6 @@ impl ArcaSystem {
                 w_up_all.extend(l.w_up.iter().cloned());
                 w_down_all.extend(l.w_down.iter().cloned());
             }
-            let w_out_flat: Vec<f32> = aggregator.w_out.iter().cloned().collect();
 
             GpuContext::new(
                 num_l,
@@ -352,8 +360,7 @@ impl ArcaSystem {
                 &bpe_emb_flat,
                 &w_fusion_flat,
                 &w_phrase_flat,
-                phrase_window,
-                32, // max_batch_size
+                phrase_window
             )
         };
 
@@ -504,7 +511,7 @@ impl ArcaSystem {
         self.gpu.dispatch_logits(&mut enc);
 
         // 3. One single stable readback sync
-        let (s_cpu_vec, logits_cpu_vec) = self.gpu.readback_stable_point(&mut enc);
+        let (s_cpu_vec, logits_cpu_vec) = self.gpu.readback_stable_point(enc);
         
         self.s_t_shadow = Array1::from_vec(s_cpu_vec);
         let full_logits = Array1::from_vec(logits_cpu_vec);
@@ -513,92 +520,6 @@ impl ArcaSystem {
         
         let sparse_logits = vec![]; // omitted for brevity if not strictly needed or could extract top_k on CPU
         let x_hat_next = self.prediction_head.predict_embedding(&self.s_t_shadow); // Still uses CPU shadow for predict embedding, or we could just use full_logits
-
-        ForwardOutput {
-            logits:           full_logits,
-            sparse_logits,
-            prediction_error: e_t,
-            next_prediction:  x_hat_next,
-            kappas,
-            tension:          self.tension,
-            beta_global:      beta_g,
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // forward_step — CPU-only path (compiled when `gpu` feature is absent)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    #[cfg(not(feature = "gpu"))]
-    
-    /// Zero-Sync GPU inference step.
-    /// No readbacks, fully executed in VRAM.
-    #[cfg(feature = "gpu")]
-    pub fn forward_step_extreme_inference(
-        &mut self,
-        raw_bytes: &[u8],
-        t: usize,
-        bpe_ids: &[u32],
-    ) -> u32 {
-        let x_t = self.encoder.encode_position(raw_bytes, t, bpe_ids);
-        let x_t_flat: Vec<f32> = x_t.iter().cloned().collect();
-        self.gpu_infer.forward_inference(&x_t_flat)
-    }
-
-    #[cfg(feature = "gpu")]
-    pub fn forward_step(
-        &mut self,
-        raw_bytes:       &[u8],
-        t:               usize,
-        bpe_ids:         &[u32],
-        prev_prediction: Option<&Array1<f32>>,
-    ) -> ForwardOutput {
-        let x_t = self.encoder.encode_position(raw_bytes, t, bpe_ids);
-
-        let e_t: Array1<f32> = match prev_prediction {
-            Some(pred) => &x_t - pred,
-            None       => Array1::zeros(D_MODEL),
-        };
-
-        let (tension_new, beta_g, lambda_g, sigma_g) =
-            self.controller.compute_climate(&e_t, self.tension);
-        self.tension = tension_new;
-
-        let s_t   = self.reservoir.step(&self.reservoir_state, &x_t);
-        let _h_st = self.lsh.hash(&s_t);
-
-        let mut kappas       = Vec::with_capacity(self.layers.len());
-        let mut layer_readouts = Vec::with_capacity(self.layers.len());
-        let eta = self.train_state.config.eta_lr_hebbian;
-
-        for (l, layer) in self.layers.iter().enumerate() {
-            let depth_scale = 1.0 / (1.0 + l as f32 * 0.1);
-            let e_local: Array1<f32> = &e_t * depth_scale;
-
-            let (m_new, kappa_l) = layer.forward_and_adapt(
-                &self.memory_states[l],
-                &e_local,
-                &s_t,
-                beta_g,
-                lambda_g,
-                sigma_g,
-                eta,
-                0.05,
-                1024.0,
-            );
-
-            let readout = layer.read_out(&m_new, &s_t);
-            layer_readouts.push(readout);
-            kappas.push(kappa_l);
-            self.memory_states[l] = m_new;
-        }
-
-        self.reservoir_state = s_t.clone();
-
-        let (full_logits, sparse_logits) =
-            self.prediction_head.forward(&s_t, &layer_readouts);
-
-        let x_hat_next = self.prediction_head.predict_embedding(&s_t);
 
         ForwardOutput {
             logits:           full_logits,
@@ -686,7 +607,7 @@ impl ArcaSystem {
         use encoder::{BPE_VOCAB_SIZE, D_BPE, D_MODEL, D_PHRASE, PHRASE_WIN_MIN};
 
         let num_l    = self.layers.len();
-        let phrase_in = PHRASE_WIN_MIN * D_BPE;
+        // let phrase_in = PHRASE_WIN_MIN * D_BPE;
 
         // ── Sync GPU → CPU for M matrices (checkpoint-only full readback) ──
         #[cfg(feature = "gpu")]
@@ -700,10 +621,8 @@ impl ArcaSystem {
             //
             // SAFETY: No other thread accesses memory_states; the GPU is idle after
             // readback_all() returns; and we only write, never reallocate.
-            let mem_states_mut = unsafe {
-                &mut *((&self.memory_states) as *const Vec<Array2<f32>>
-                    as *mut Vec<Array2<f32>>)
-            };
+            let self_mut = self as *const Self as *mut Self;
+            let mem_states_mut = unsafe { &mut (*self_mut).memory_states };
             for (l, m_flat) in readback.m_states.iter().enumerate() {
                 mem_states_mut[l] = Array2::from_shape_vec(
                     (RANK_R, RANK_R),
@@ -715,9 +634,9 @@ impl ArcaSystem {
         // ── Flatten all parameters ────────────────────────────────────────
         let bpe_emb_flat:  Vec<f32> = self.encoder.bpe_embeddings.iter().cloned().collect();
         let w_fusion_flat: Vec<f32> = self.encoder.w_fusion.iter().cloned().collect();
-        let w_phrase_flat: Vec<f32> = self.encoder.w_phrase.iter().cloned().collect();
+        // let w_phrase_flat: Vec<f32> = self.encoder.w_phrase.iter().cloned().collect();
         let w_in_flat:     Vec<f32> = self.reservoir.w_in.iter().cloned().collect();
-        let w_lsh_flat:    Vec<f32> = self.lsh.w_lsh.iter().cloned().collect();
+        // let w_lsh_flat:    Vec<f32> = self.lsh.w_lsh.iter().cloned().collect();
         let w_out_flat:    Vec<f32> = self.prediction_head.aggregator.w_out.iter().cloned().collect();
         let out_emb_flat:  Vec<f32> = self.prediction_head.head.output_embeddings.iter().cloned().collect();
         let out_bias_flat: Vec<f32> = self.prediction_head.head.output_bias.iter().cloned().collect();
@@ -766,9 +685,9 @@ impl ArcaSystem {
         let mut entries: Vec<(&str, &[f32], &[usize])> = vec![
             ("bpe_embeddings",    &bpe_emb_flat,  &[BPE_VOCAB_SIZE, D_BPE]),
             ("w_fusion",          &w_fusion_flat, &[D_MODEL, D_MODEL]),
-            ("w_phrase",          &w_phrase_flat, &[D_PHRASE, phrase_in]),
+            // // ("w_phrase",          &w_phrase_flat, &[D_PHRASE, phrase_in]),
             ("w_in",              &w_in_flat,     &[N_RES, D_MODEL]),
-            ("w_lsh",             &w_lsh_flat,    &[header.lsh_k, N_RES]),
+            // // ("w_lsh",             &w_lsh_flat,    &[header.lsh_k, N_RES]),
             ("w_out",             &w_out_flat,    &[D_MODEL, N_RES]),
             ("output_embeddings", &out_emb_flat,  &[VOCAB_SIZE, D_MODEL]),
             ("output_bias",       &out_bias_flat, &[VOCAB_SIZE]),
@@ -1098,4 +1017,107 @@ fn run_infer(sovereign_path: &str, tokenizer_path: &str, prompt: &str) {
             }
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PyO3 Python Bindings
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "gpu")]
+#[pyclass]
+pub struct ArcaModel {
+    system: ArcaSystem,
+    tokenizer: BpeTokenizer,
+}
+
+#[cfg(feature = "gpu")]
+#[pymethods]
+impl ArcaModel {
+    #[new]
+    fn new(sovereign_path: &str, tokenizer_path: &str) -> PyResult<Self> {
+        let model = SovereignModel::load_from_file(sovereign_path)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to load model: {:?}", e)))?;
+        let system = ArcaSystem::from_sovereign(&model)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to build ARCA system: {:?}", e)))?;
+        
+        let tokenizer = if std::path::Path::new(tokenizer_path).exists() {
+            BpeTokenizer::load_from_json(tokenizer_path)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to load tokenizer: {:?}", e)))?
+        } else {
+            BpeTokenizer::new_base()
+        };
+
+        Ok(ArcaModel { system, tokenizer })
+    }
+
+    fn encode(&self, text: &str) -> Vec<u32> {
+        self.tokenizer.encode_aligned(text.as_bytes())
+    }
+
+    fn decode(&self, ids: Vec<u32>) -> String {
+        let bytes = self.tokenizer.decode(&ids);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn generate(&mut self, prompt: &str, max_tokens: usize, temperature: f32) -> String {
+        self.system.reset_state();
+        let bytes = prompt.as_bytes();
+        let bpe_ids = self.tokenizer.encode_aligned(bytes);
+        
+        let mut prev_pred: Option<Array1<f32>> = None;
+        for t in 0..bytes.len() {
+            let output = self.system.forward_step(bytes, t, &bpe_ids, prev_pred.as_ref());
+            prev_pred = Some(output.next_prediction.clone());
+        }
+
+        let mut generated_ids = Vec::new();
+        let mut current_bytes = bytes.to_vec();
+        let mut current_bpe_ids = bpe_ids.clone();
+
+        for _ in 0..max_tokens {
+            let t = current_bytes.len() - 1;
+            let output = self.system.forward_step(&current_bytes, t, &current_bpe_ids, prev_pred.as_ref());
+            prev_pred = Some(output.next_prediction.clone());
+
+            let next_token = if temperature <= 1e-5 {
+                output.logits.iter().cloned().enumerate()
+                    .fold((0, f32::NEG_INFINITY), |max, (idx, val)| if val > max.1 { (idx, val) } else { max }).0 as u32
+            } else {
+                let max_logit = output.logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = output.logits.iter().map(|&l| ((l - max_logit) / temperature).exp()).collect();
+                let sum_exp: f32 = exps.iter().sum();
+                
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                let target = rng.gen_range(0.0..sum_exp);
+                
+                let mut acc = 0.0;
+                let mut chosen = 0;
+                for (i, &e) in exps.iter().enumerate() {
+                    acc += e;
+                    if acc >= target {
+                        chosen = i;
+                        break;
+                    }
+                }
+                chosen as u32
+            };
+
+            generated_ids.push(next_token);
+            
+            let token_bytes = self.tokenizer.decode(&[next_token]);
+            current_bytes.extend_from_slice(&token_bytes);
+            current_bpe_ids = self.tokenizer.encode_aligned(&current_bytes);
+        }
+
+        let gen_bytes = self.tokenizer.decode(&generated_ids);
+        String::from_utf8_lossy(&gen_bytes).into_owned()
+    }
+}
+
+#[pymodule]
+fn arca(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    #[cfg(feature = "gpu")]
+    m.add_class::<ArcaModel>()?;
+    Ok(())
 }

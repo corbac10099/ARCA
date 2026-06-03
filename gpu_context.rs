@@ -341,7 +341,7 @@ impl GpuContext {
 
         let make_pl = |m, bgl| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[bgl], push_constant_ranges: &[] });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&layout), module: m, entry_point: "main", compilation_options: Default::default(), cache: None })
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&layout), module: m, entry_point: "main", compilation_options: Default::default()  })
         };
 
         let res_pl = make_pl(&res_mod, &res_bgl);
@@ -548,7 +548,7 @@ impl GpuContext {
     }
     
     /// Trigger single readback sync for s_t and logits
-    pub fn readback_stable_point(&mut self, enc: &mut wgpu::CommandEncoder) -> (Vec<f32>, Vec<f32>) {
+    pub fn readback_stable_point(&mut self, mut enc: wgpu::CommandEncoder) -> (Vec<f32>, Vec<f32>) {
         enc.copy_buffer_to_buffer(&self.buf_s[self.s_ping], 0, &self.buf_s_readback, 0, (N_RES * 4) as u64);
         enc.copy_buffer_to_buffer(&self.buf_logits, 0, &self.buf_logits_readback, 0, (VOCAB_SIZE * 4) as u64);
         

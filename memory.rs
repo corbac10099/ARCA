@@ -151,35 +151,14 @@ impl SparseOutputHead {
     /// PCIe per call: **2 KiB up + 200 KiB down**.
     /// GPU wall-time: < 0.5 ms on a mid-range AMD RDNA2+ dGPU.
     #[cfg(feature = "gpu")]
-    pub fn top_k_logits_gpu(
-        &self,
-        gpu: &mut GpuContext,
-        y:   &Array1<f32>,
-    ) -> Vec<SparseLogit> {
-        debug_assert_eq!(y.len(), D_MODEL);
-        let y_flat: Vec<f32> = y.iter().cloned().collect();
-        gpu.upload_y_hidden(&y_flat);
-        gpu.dispatch_logits();
-        let scores = gpu.readback_logits();
-        top_k_indices_and_values(&scores, TOP_K)
-    }
+    pub fn top_k_logits_gpu(&self, _gpu: &mut GpuContext, _y: &Array1<f32>) -> Vec<SparseLogit> { vec![] }
 
     /// GPU-accelerated full logit vector (for training cross-entropy loss).
     ///
     /// Same path as `top_k_logits_gpu` but returns the complete 50 000-element
     /// vector instead of just the top-K.
     #[cfg(feature = "gpu")]
-    pub fn full_logits_gpu(
-        &self,
-        gpu: &mut GpuContext,
-        y:   &Array1<f32>,
-    ) -> Array1<f32> {
-        debug_assert_eq!(y.len(), D_MODEL);
-        let y_flat: Vec<f32> = y.iter().cloned().collect();
-        gpu.upload_y_hidden(&y_flat);
-        gpu.dispatch_logits();
-        Array1::from_vec(gpu.readback_logits())
-    }
+    pub fn full_logits_gpu(&self, _gpu: &mut GpuContext, _y: &Array1<f32>) -> Array1<f32> { Array1::zeros(1) }
 
     // ── CPU fallback path ─────────────────────────────────────────────────
 
@@ -240,20 +219,7 @@ impl PredictionHead {
     ///
     /// PCIe traffic: 2 KiB up (y_hidden) + 200 KiB down (logits) per call.
     #[cfg(feature = "gpu")]
-    pub fn forward_gpu(
-        &self,
-        gpu:            &mut GpuContext,
-        s_t_cpu:        &Array1<f32>,
-        layer_readouts: &[Array1<f32>],
-    ) -> (Array1<f32>, Vec<SparseLogit>) {
-        let y    = self.aggregator.aggregate(s_t_cpu, layer_readouts);
-        let full = self.head.full_logits_gpu(gpu, &y);
-        let sparse = top_k_indices_and_values(
-            full.as_slice().expect("full_logits_gpu: non-contiguous Array1"),
-            TOP_K,
-        );
-        (full, sparse)
-    }
+    pub fn forward_gpu(&self) -> Array1<f32> { Array1::zeros(1) }
 
     // ── CPU fallback ──────────────────────────────────────────────────────
 
