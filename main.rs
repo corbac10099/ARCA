@@ -202,6 +202,7 @@ impl ArcaSystem {
                 &w_fusion_flat,
                 &w_phrase_flat,
                 phrase_window,
+                32, // max_batch_size
             )
         };
 
@@ -334,6 +335,7 @@ impl ArcaSystem {
                 &w_fusion_flat,
                 &w_phrase_flat,
                 phrase_window,
+                32, // max_batch_size
             )
         };
 
@@ -376,48 +378,55 @@ impl ArcaSystem {
     /// No full matrix transfer (R, W_in, embeddings) in the hot loop.
     #[cfg(feature = "gpu")]
     
-    /// Zero-Sync GPU inference step (Phase 2: Top-K Sampling).
-    /// Retrieves Top-K tokens and their logits from VRAM, applies temperature,
-    /// and performs a weighted random choice.
+    /// Zero-Sync GPU inference step (Phase 4: Batching + Top-K Sampling).
     #[cfg(feature = "gpu")]
     pub fn forward_step_extreme_inference(
         &mut self,
-        raw_bytes: &[u8],
-        t: usize,
-        bpe_ids: &[u32],
+        bytes_batch: &[Vec<u8>],
+        t_batch: &[usize],
+        bpe_ids_batch: &[Vec<u32>],
         temperature: f32,
-    ) -> u32 {
-        let (top_k_tokens, top_k_logits) = self.gpu_infer.forward_inference(raw_bytes, t, bpe_ids);
+    ) -> Vec<u32> {
+        let (top_k_tokens_batch, top_k_logits_batch) = self.gpu_infer.forward_inference(bytes_batch, t_batch, bpe_ids_batch);
         
-        if temperature <= 1e-5 {
-            // Greedy fallback
-            return top_k_tokens[0];
-        }
-
-        // Apply temperature and softmax
-        let max_logit = top_k_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut exps = Vec::with_capacity(top_k_logits.len());
-        let mut sum_exp = 0.0;
+        let mut chosen_tokens = Vec::with_capacity(bytes_batch.len());
         
-        for &l in &top_k_logits {
-            let e = ((l - max_logit) / temperature).exp();
-            exps.push(e);
-            sum_exp += e;
-        }
-
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let target = rng.gen_range(0.0..sum_exp);
-        
-        let mut acc = 0.0;
-        for (i, &e) in exps.iter().enumerate() {
-            acc += e;
-            if acc >= target {
-                return top_k_tokens[i];
+        for b in 0..bytes_batch.len() {
+            let top_k_tokens = &top_k_tokens_batch[b];
+            let top_k_logits = &top_k_logits_batch[b];
+            
+            if temperature <= 1e-5 {
+                chosen_tokens.push(top_k_tokens[0]);
+                continue;
             }
+
+            let max_logit = top_k_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut exps = Vec::with_capacity(top_k_logits.len());
+            let mut sum_exp = 0.0;
+            
+            for &l in top_k_logits {
+                let e = ((l - max_logit) / temperature).exp();
+                exps.push(e);
+                sum_exp += e;
+            }
+
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let target = rng.gen_range(0.0..sum_exp);
+            
+            let mut acc = 0.0;
+            let mut chosen = top_k_tokens[top_k_tokens.len() - 1];
+            for (i, &e) in exps.iter().enumerate() {
+                acc += e;
+                if acc >= target {
+                    chosen = top_k_tokens[i];
+                    break;
+                }
+            }
+            chosen_tokens.push(chosen);
         }
         
-        top_k_tokens[top_k_tokens.len() - 1]
+        chosen_tokens
     }
 
     #[cfg(feature = "gpu")]

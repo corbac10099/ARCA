@@ -23,14 +23,19 @@ pub const fn align_up(x: usize, align: usize) -> usize {
 
 
 pub const ENCODER_SHADER: &str = r#"
-struct EncoderParams {
+
+
+@group(0) @binding(0) var<storage, read> bpe_embeddings: array<u32>;
+@group(0) @binding(1) var<storage, read> w_fusion: array<u32>;
+@group(0) @binding(2) var<storage, read> w_phrase: array<u32>;
+@group(0) @binding(3) var<storage, read_write> x_t_out: array<f32>;
+struct BatchInput {
     bpe_id_t: u32,
     t: u32,
     window_size: u32,
     byte_0: u32,
     byte_1: u32,
     byte_2: u32,
-    
     bpe_0: u32,
     bpe_1: u32,
     bpe_2: u32,
@@ -42,12 +47,7 @@ struct EncoderParams {
     _pad0: u32,
     _pad1: u32,
 }
-
-@group(0) @binding(0) var<storage, read> bpe_embeddings: array<u32>;
-@group(0) @binding(1) var<storage, read> w_fusion: array<u32>;
-@group(0) @binding(2) var<storage, read> w_phrase: array<u32>;
-@group(0) @binding(3) var<storage, read_write> x_t_out: array<f32>;
-@group(0) @binding(4) var<uniform> params: EncoderParams;
+@group(0) @binding(4) var<storage, read> batch_inputs: array<BatchInput>;
 
 
 fn get_f16(arr: ptr<storage, array<u32>, read>, i: u32) -> f32 {
@@ -70,8 +70,10 @@ fn ngram_hash(bytes: array<u32, 3>, len: u32) -> (Vec<u32>, Vec<f32>) {
 }
 
 @compute @workgroup_size(64, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tid = lid.x;
+    let b = gid.y;
+
 
     for (var i = tid; i < 512u; i += 64u) {
         concat[i] = 0.0;
@@ -79,12 +81,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     workgroupBarrier();
 
     if tid == 0u {
-        let b = array<u32, 3>(params.byte_0, params.byte_1, params.byte_2);
+        let b = array<u32, 3>(batch_inputs[b].byte_0, batch_inputs[b].byte_1, batch_inputs[b].byte_2);
         var e_bytes_local = array<f32, 128>();
         for (var i=0u; i<128u; i++) { e_bytes_local[i] = 0.0; }
 
         for (var n = 1u; n <= 3u; n++) {
-            if params.t + 1u >= n {
+            if batch_inputs[b].t + 1u >= n {
                 var gram = array<u32, 3>(0u, 0u, 0u);
                 if n == 1u { gram[0] = b[0]; }
                 else if n == 2u { gram[0] = b[1]; gram[1] = b[0]; }
@@ -107,7 +109,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
     
     if tid < 64u {
-        let id = params.bpe_id_t % BPE_VOCAB_SIZE_C;
+        let id = batch_inputs[b].bpe_id_t % BPE_VOCAB_SIZE_C;
         let base_concat = 128u;
         for (var k = 0u; k < 4u; k++) {
             let offset = tid * 4u + k;
@@ -116,15 +118,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
 
     if tid < 64u {
-        let bpes = array<u32, 8>(params.bpe_0, params.bpe_1, params.bpe_2, params.bpe_3, params.bpe_4, params.bpe_5, params.bpe_6, params.bpe_7);
-        let win = params.window_size;
+        let bpes = array<u32, 8>(batch_inputs[b].bpe_0, batch_inputs[b].bpe_1, batch_inputs[b].bpe_2, batch_inputs[b].bpe_3, batch_inputs[b].bpe_4, batch_inputs[b].bpe_5, batch_inputs[b].bpe_6, batch_inputs[b].bpe_7);
+        let win = batch_inputs[b].window_size;
         
         for (var p = 0u; p < 2u; p++) {
             let row = tid * 2u + p;
             var dot = 0.0;
             for (var k = 0u; k < win; k++) {
                 let pos_idx = win - 1u - k;
-                if params.t >= pos_idx {
+                if batch_inputs[b].t >= pos_idx {
                     let bpe_id = bpes[pos_idx] % BPE_VOCAB_SIZE_C;
                     let emb_base = bpe_id * 256u;
                     let w_base = row * win * 256u + k * 256u;
@@ -146,7 +148,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         for (var c = 0u; c < 512u; c++) {
             dot += get_f16(&w_fusion, w_base + c) * concat[c];
         }
-        x_t_out[row] = dot;
+        x_t_out[b * 512u + row] = dot;
     }
 }
 "#;
@@ -171,20 +173,21 @@ const D_MODEL_C: u32 = 512u;
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i: u32 = gid.x;
+    let b: u32 = gid.y;
     if i >= N_RES_C { return; }
 
     var acc_r: f32 = 0.0;
     let row_r: u32 = i * N_RES_C;
     for (var k = 0u; k < N_RES_C; k++) {
-        acc_r += get_f16(&r_matrix, row_r + k) * s_prev[k];
+        acc_r += get_f16(&r_matrix, row_r + k) * s_prev[b * N_RES_C + k];
     }
 
     var acc_w: f32 = 0.0;
     let row_w: u32 = i * D_MODEL_C;
     for (var m = 0u; m < D_MODEL_C; m++) {
-        acc_w += get_f16(&w_in, row_w + m) * x_t[m];
+        acc_w += get_f16(&w_in, row_w + m) * x_t[b * D_MODEL_C + m];
     }
-    s_out[i] = tanh(acc_r + acc_w);
+    s_out[b * N_RES_C + i] = tanh(acc_r + acc_w);
 }
 "#;
 
@@ -210,18 +213,19 @@ const RANK_R_C: u32 = 32u;
 var<workgroup> shared_local_s: array<f32, 32>;
 
 @compute @workgroup_size(32, 1, 1)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let l = wid.x;
+    let b = gid.y;
     if l >= num_layers { return; }
     let i = lid;
 
     var dot_s = 0.0;
     let w_up_offset = (l * RANK_R_C + i) * N_RES_C;
     for (var k = 0u; k < N_RES_C; k++) {
-        dot_s += get_f16(&w_up_all, w_up_offset + k) * s_t[k];
+        dot_s += get_f16(&w_up_all, w_up_offset + k) * s_t[b * N_RES_C + k];
     }
     shared_local_s[i] = dot_s;
-    local_s_all[l * RANK_R_C + i] = dot_s;
+    local_s_all[b * (num_layers * RANK_R_C) + l * RANK_R_C + i] = dot_s;
 
     workgroupBarrier();
 
@@ -230,7 +234,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     for (var j = 0u; j < RANK_R_C; j++) {
         dot_ro += get_f16(&m_all, m_offset + j) * shared_local_s[j];
     }
-    ro_all[l * RANK_R_C + i] = dot_ro;
+    ro_all[b * (num_layers * RANK_R_C) + l * RANK_R_C + i] = dot_ro;
 }
 "#;
 
@@ -256,6 +260,7 @@ const D_MODEL_C: u32 = 512u;
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let j = gid.x;
+    let b = gid.y;
     if j >= D_MODEL_C { return; }
 
     var dot = 0.0;
@@ -266,19 +271,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i=0u; i<RANK_R_C; i++) { mod_sums[i] = 0.0; }
     for (var l=0u; l<num_layers; l++) {
         for (var i=0u; i<RANK_R_C; i++) {
-            mod_sums[i] += ro_all[l * RANK_R_C + i];
+            mod_sums[i] += ro_all[b * (num_layers * RANK_R_C) + l * RANK_R_C + i];
         }
     }
 
     for (var k = 0u; k < N_RES_C; k++) {
-        var s_val = s_t[k];
+        var s_val = s_t[b * N_RES_C + k];
         if k < RANK_R_C {
             s_val += mod_sums[k];
         }
         dot += get_f16(&w_out, w_out_offset + k) * s_val;
     }
-    y_hidden[j] = dot;
-    prev_prediction[j] = dot;
+    y_hidden[b * D_MODEL_C + j] = dot;
+    prev_prediction[b * D_MODEL_C + j] = dot;
 }
 "#;
 
@@ -301,14 +306,15 @@ const D_MODEL_C:    u32 = 512u;
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v: u32 = gid.x;
+    let b: u32 = gid.y;
     if v >= VOCAB_SIZE_C { return; }
 
     var dot: f32 = 0.0;
     let row_base: u32 = v * D_MODEL_C;
     for (var k = 0u; k < D_MODEL_C; k++) {
-        dot += get_f16(&output_embeddings, row_base + k) * y_hidden[k];
+        dot += get_f16(&output_embeddings, row_base + k) * y_hidden[b * D_MODEL_C + k];
     }
-    logits_out[v] = dot + get_f16(&output_bias, v);
+    logits_out[b * VOCAB_SIZE_C + v] = dot + get_f16(&output_bias, v);
 }
 "#;
 
@@ -326,13 +332,14 @@ var<workgroup> shared_max_idx: array<u32, 256>;
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let stride = 256u;
+    let b = gid.y;
     
     for (var k_idx = 0u; k_idx < K_VAL_C; k_idx++) {
         var max_val = -999999.0;
         var max_idx = 0u;
 
         for (var i = lid; i < VOCAB_SIZE_C; i += stride) {
-            let v = logits_out[i];
+            let v = logits_out[b * N_RES_C + i];
             if v > max_val {
                 max_val = v;
                 max_idx = i;
@@ -356,10 +363,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         if lid == 0u {
             let best_idx = shared_max_idx[0];
             let best_val = shared_max_val[0];
-            top_k_tokens[k_idx] = best_idx;
-            top_k_probs[k_idx] = best_val;
+            top_k_tokens[b * K_VAL_C + k_idx] = best_idx;
+            top_k_probs[b * K_VAL_C + k_idx] = best_val;
             
-            logits_out[best_idx] = -999999.0;
+            logits_out[b * VOCAB_SIZE_C + best_idx] = -999999.0;
         }
         
         storageBarrier();
@@ -426,6 +433,7 @@ pub struct GpuInferenceContext {
     buf_top_k_tokens_readback: wgpu::Buffer,
     buf_top_k_probs_readback: wgpu::Buffer,
     pub top_k_size: usize,
+    pub max_batch_size: usize,
     
     num_layers: usize,
 }
@@ -497,7 +505,7 @@ impl GpuInferenceContext {
             count: None,
         };
 
-        let enc_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), uni(4)] });
+        let enc_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), ro(4)] });
         let res_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), ro(3), rw(4)] });
         let proj_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), rw(4), uni(5)] });
         let agg_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), rw(4), uni(5)] });
@@ -524,13 +532,13 @@ impl GpuInferenceContext {
         let buf_bpe_embeddings = upload_u32(&pack_f32_to_f16(bpe_embeddings_data), "bpe_emb");
         let buf_w_fusion = upload_u32(&pack_f32_to_f16(w_fusion_data), "w_fus");
         let buf_w_phrase = upload_u32(&pack_f32_to_f16(w_phrase_data), "w_phr");
-        let buf_encoder_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("enc_p"), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let buf_encoder_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("enc_p"), size: (max_batch_size * 64) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let buf_r = upload_u32(&pack_f32_to_f16(r_matrix_data), "r");
         let buf_w_in = upload_u32(&pack_f32_to_f16(w_in_data), "w_in");
-        let buf_s = [empty(N_RES, "s0"), empty(N_RES, "s1")];
-        let buf_x_t = empty(D_MODEL, "x_t");
-        let buf_y_hidden = empty(D_MODEL, "y");
-        let buf_prev_pred = empty(D_MODEL, "prev");
+        let buf_s = [empty(max_batch_size * N_RES, "s0"), empty(max_batch_size * N_RES, "s1")];
+        let buf_x_t = empty(max_batch_size * D_MODEL, "x_t");
+        let buf_y_hidden = empty(max_batch_size * D_MODEL, "y");
+        let buf_prev_pred = empty(max_batch_size * D_MODEL, "prev");
         
         let buf_w_up_all = upload_u32(&pack_f32_to_f16(w_up_all_data), "w_up_all");
         let buf_w_out = upload_u32(&pack_f32_to_f16(w_out_data), "w_out");
@@ -538,22 +546,22 @@ impl GpuInferenceContext {
         let packed_m = pack_f32_to_f16(m_base_all_data);
         let buf_m_all = [upload_u32(&packed_m, "m0"), upload_u32(&packed_m, "m1")];
         
-        let buf_local_s_all = empty(num_layers * RANK_R, "loc_s");
-        let buf_ro_all = empty(num_layers * RANK_R, "ro");
+        let buf_local_s_all = empty(max_batch_size * num_layers * RANK_R, "loc_s");
+        let buf_ro_all = empty(max_batch_size * num_layers * RANK_R, "ro");
         
         let buf_num_layers = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("num_layers"),
             contents: bytemuck::cast_slice(&[num_layers as u32]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let buf_out_emb = upload_u32(&pack_f32_to_f16(out_emb_data), "emb");
         let buf_out_bias = upload_u32(&pack_f32_to_f16(out_bias_data), "bias");
-        let buf_logits = empty(VOCAB_SIZE, "log");
-        let buf_top_k_tokens = empty(50, "token_k");
-        let buf_top_k_probs = empty(50, "prob_k");
-        let buf_top_k_tokens_readback = readback(50, "token_k_rb");
-        let buf_top_k_probs_readback = readback(50, "prob_k_rb");
+        let buf_logits = empty(max_batch_size * VOCAB_SIZE, "log");
+        let buf_top_k_tokens = empty(max_batch_size * 50, "token_k");
+        let buf_top_k_probs = empty(max_batch_size * 50, "prob_k");
+        let buf_top_k_tokens_readback = readback(max_batch_size * 50, "token_k_rb");
+        let buf_top_k_probs_readback = readback(max_batch_size * 50, "prob_k_rb");
         let top_k_size = 50;
 
         GpuInferenceContext {
@@ -562,38 +570,49 @@ impl GpuInferenceContext {
             buf_bpe_embeddings, buf_w_fusion, buf_w_phrase, buf_encoder_params, phrase_window,
             buf_r, buf_w_in, buf_s, s_ping: 0, buf_x_t, buf_y_hidden, buf_prev_pred,
             buf_w_up_all, buf_w_out, buf_m_all, m_ping: 0, buf_local_s_all, buf_ro_all, buf_num_layers,
+            max_batch_size,
             buf_out_emb, buf_out_bias, buf_logits, buf_top_k_tokens, buf_top_k_probs, buf_top_k_tokens_readback, buf_top_k_probs_readback, top_k_size,
             num_layers,
+            max_batch_size,
         }
     }
 
     /// Single call to perform the entire forward pass and return 1 token ID.
     pub fn forward_inference(
         &mut self,
-        bytes: &[u8],
-        t: usize,
-        bpe_ids: &[u32],
-    ) -> (Vec<u32>, Vec<f32>) {
-        let bpe_id_t = bpe_ids[t];
-        let mut byte_0 = 0u32; let mut byte_1 = 0u32; let mut byte_2 = 0u32;
-        if t < bytes.len() { byte_0 = bytes[t] as u32; }
-        if t >= 1 { byte_1 = bytes[t-1] as u32; }
-        if t >= 2 { byte_2 = bytes[t-2] as u32; }
+        bytes_batch: &[Vec<u8>],
+        t_batch: &[usize],
+        bpe_ids_batch: &[Vec<u32>],
+    ) -> (Vec<Vec<u32>>, Vec<Vec<f32>>) {
+        let b = bytes_batch.len();
+        assert!(b <= self.max_batch_size);
 
-        let mut bpes = [0u32; 8];
-        for k in 0..8 {
-            if t >= k { bpes[k] = bpe_ids[t-k]; }
+        let mut params = Vec::with_capacity(b * 16);
+        for i in 0..b {
+            let bytes = &bytes_batch[i];
+            let t = t_batch[i];
+            let bpe_ids = &bpe_ids_batch[i];
+            
+            let bpe_id_t = bpe_ids[t];
+            let mut byte_0 = 0u32; let mut byte_1 = 0u32; let mut byte_2 = 0u32;
+            if t < bytes.len() { byte_0 = bytes[t] as u32; }
+            if t >= 1 { byte_1 = bytes[t-1] as u32; }
+            if t >= 2 { byte_2 = bytes[t-2] as u32; }
+
+            let mut bpes = [0u32; 8];
+            for k in 0..8 {
+                if t >= k { bpes[k] = bpe_ids[t-k]; }
+            }
+
+            params.extend_from_slice(&[
+                bpe_id_t, t as u32, self.phrase_window as u32,
+                byte_0, byte_1, byte_2,
+                bpes[0], bpes[1], bpes[2], bpes[3],
+                bpes[4], bpes[5], bpes[6], bpes[7],
+                0, 0
+            ]);
         }
-
-        let params: [u32; 16] = [
-            bpe_id_t, t as u32, self.phrase_window as u32,
-            byte_0, byte_1, byte_2,
-            bpes[0], bpes[1], bpes[2], bpes[3],
-            bpes[4], bpes[5], bpes[6], bpes[7],
-            0, 0
-        ];
         self.queue.write_buffer(&self.buf_encoder_params, 0, bytemuck::cast_slice(&params));
-        
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         // 0. Encoder
@@ -604,13 +623,13 @@ impl GpuInferenceContext {
                 wgpu::BindGroupEntry { binding: 1, resource: self.buf_w_fusion.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.buf_w_phrase.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.buf_x_t.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.buf_encoder_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.buf_encoder_batch_inputs[b].as_entire_binding() },
             ],
         });
         {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             cp.set_pipeline(&self.enc_pl); cp.set_bind_group(0, &bg_enc, &[]);
-            cp.dispatch_workgroups(1, 1, 1); // 64 threads are enough to process x_t
+            cp.dispatch_workgroups(1, b as u32, 1); are enough to process x_t
         }
 
         // 1. Reservoir
@@ -629,7 +648,7 @@ impl GpuInferenceContext {
         {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             cp.set_pipeline(&self.res_pl); cp.set_bind_group(0, &bg_res, &[]);
-            cp.dispatch_workgroups((N_RES as u32 + 63) / 64, 1, 1);
+            cp.dispatch_workgroups((N_RES as u32 + 63) / 64, b as u32, 1);
         }
         self.s_ping = next_s;
 
@@ -648,7 +667,7 @@ impl GpuInferenceContext {
         {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             cp.set_pipeline(&self.proj_pl); cp.set_bind_group(0, &bg_proj, &[]);
-            cp.dispatch_workgroups(self.num_layers as u32, 1, 1);
+            cp.dispatch_workgroups(self.num_layers as u32, b as u32, 1);
         }
 
         // 3. Aggregate
@@ -666,7 +685,7 @@ impl GpuInferenceContext {
         {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             cp.set_pipeline(&self.agg_pl); cp.set_bind_group(0, &bg_agg, &[]);
-            cp.dispatch_workgroups((D_MODEL as u32 + 63) / 64, 1, 1);
+            cp.dispatch_workgroups((D_MODEL as u32 + 63) / 64, b as u32, 1);
         }
 
         // 4. Logits
@@ -682,7 +701,7 @@ impl GpuInferenceContext {
         {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             cp.set_pipeline(&self.log_pl); cp.set_bind_group(0, &bg_log, &[]);
-            cp.dispatch_workgroups((VOCAB_SIZE as u32 + 255) / 256, 1, 1);
+            cp.dispatch_workgroups((VOCAB_SIZE as u32 + 255) / 256, b as u32, 1);
         }
 
         // 5. Sampling
@@ -697,7 +716,7 @@ impl GpuInferenceContext {
         {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             cp.set_pipeline(&self.samp_pl); cp.set_bind_group(0, &bg_samp, &[]);
-            cp.dispatch_workgroups(1, 1, 1);
+            cp.dispatch_workgroups(1, b as u32, 1);
         }
 
         enc.copy_buffer_to_buffer(&self.buf_top_k_tokens, 0, &self.buf_top_k_tokens_readback, 0, (self.top_k_size * 4) as u64);
@@ -719,15 +738,25 @@ impl GpuInferenceContext {
         rx2.recv().unwrap().unwrap();
         
         let mapped_tok = slice_tok.get_mapped_range();
-        let tokens = bytemuck::cast_slice::<u8, u32>(&mapped_tok).to_vec();
+        let flat_tokens = bytemuck::cast_slice::<u8, u32>(&mapped_tok).to_vec();
         drop(mapped_tok);
         self.buf_top_k_tokens_readback.unmap();
         
         let mapped_prob = slice_prob.get_mapped_range();
-        let probs = bytemuck::cast_slice::<u8, f32>(&mapped_prob).to_vec();
+        let flat_probs = bytemuck::cast_slice::<u8, f32>(&mapped_prob).to_vec();
         drop(mapped_prob);
         self.buf_top_k_probs_readback.unmap();
         
-        (tokens, probs)
+        let mut out_tokens = Vec::with_capacity(b);
+        let mut out_probs = Vec::with_capacity(b);
+        for i in 0..b {
+            let start = i * self.top_k_size;
+            let end = start + self.top_k_size;
+            out_tokens.push(flat_tokens[start..end].to_vec());
+            out_probs.push(flat_probs[start..end].to_vec());
+        }
+        
+        (out_tokens, out_probs)
+    
     }
 }
