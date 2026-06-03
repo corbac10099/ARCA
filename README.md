@@ -61,6 +61,37 @@ Gère le "climat" (macro-variables) qui module la plasticité selon l'erreur de 
 
 ## 📦 Installation & Compilation
 
+### Option A : Librairie Python (PyPI / Maturin) - Nouveau ! 🐍
+ARCA est désormais utilisable directement depuis Python, à la manière de `llama.cpp`.
+
+```bash
+# Prérequis : installer maturin
+pip install maturin
+
+# Compiler la wheel Python (depuis la racine du projet)
+maturin build --release -F gpu
+
+# Installer la wheel générée
+pip install target/wheels/arca-*.whl
+```
+
+#### Utilisation du CLI Python
+Vous pouvez utiliser ARCA depuis le terminal Python :
+```bash
+python -m arca.main -m ./model.sovereign -p "Hello World" -n 100 --temp 0.8
+```
+
+#### Utilisation en script Python
+```python
+from arca import PyArcaModel
+
+model = PyArcaModel("./model.sovereign")
+tokens = model.generate("Hello World", max_tokens=100, temperature=0.8)
+print(model.decode(tokens))
+```
+
+### Option B : Compilation Rust Native
+
 ARCA nécessite **Rust (Edition 2021)** et un GPU compatible avec les backends **wgpu**.
 
 ```bash
