@@ -185,7 +185,7 @@ const BPE_VOCAB_SIZE_C: u32 = 4096u;
 
 var<workgroup> concat: array<f32, 512>;
 
-fn ngram_hash(bytes: array<u32, 3>, len: u32) -> (Vec<u32>, Vec<f32>) {
+fn ngram_hash(bytes: array<u32, 3>, len: u32) -> u32 {
     var h: u32 = 2166136261u;
     for (var i = 0u; i < len; i++) {
         h = h ^ bytes[i];
