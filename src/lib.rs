@@ -411,6 +411,7 @@ impl ArcaSystem {
         t_batch: &[usize],
         bpe_ids_batch: &[Vec<u32>],
         temperature: f32,
+        top_p: f32,
     ) -> Vec<u32> {
         let (top_k_tokens_batch, top_k_logits_batch) = self.gpu_infer.forward_inference(bytes_batch, t_batch, bpe_ids_batch);
         
@@ -437,11 +438,30 @@ impl ArcaSystem {
 
             use rand::Rng;
             let mut rng = rand::thread_rng();
-            let target = rng.gen_range(0.0..sum_exp);
+
+            // Sort by probability descending to apply Top-P
+            let mut sorted: Vec<(usize, f32)> = exps.iter().copied().enumerate().collect();
+            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut cumulative_prob = 0.0;
+            let mut filtered_exps = Vec::new();
+            let mut new_sum_exp = 0.0;
+
+            for &(i, p) in &sorted {
+                let prob = p / sum_exp;
+                filtered_exps.push((i, p));
+                new_sum_exp += p;
+                cumulative_prob += prob;
+                if cumulative_prob >= top_p {
+                    break;
+                }
+            }
+
+            let target = rng.gen_range(0.0..new_sum_exp);
             
             let mut acc = 0.0;
-            let mut chosen = top_k_tokens[top_k_tokens.len() - 1];
-            for (i, &e) in exps.iter().enumerate() {
+            let mut chosen = top_k_tokens[filtered_exps.last().unwrap().0];
+            for &(i, e) in &filtered_exps {
                 acc += e;
                 if acc >= target {
                     chosen = top_k_tokens[i];
@@ -564,6 +584,23 @@ impl ArcaSystem {
         }
         for (l, layer) in self.layers.iter_mut().enumerate() {
             layer.gamma = new_gammas[l];
+        }
+
+        // Full-GPU AdamW Backprop for the prediction head (W_out, embeddings, bias)
+        #[cfg(feature = "gpu")]
+        {
+            let grad_logits = crate::train::grad_cross_entropy_wrt_logits(&output.logits, target_token);
+            let lr = self.train_state.config.learning_rate;
+            let step = (self.train_state.step + 1) as f32;
+            let beta1 = 0.9;
+            let beta2 = 0.999;
+            let eps = 1e-8;
+            let weight_decay = 0.01;
+            
+            self.gpu_infer.dispatch_backward(
+                grad_logits.as_slice().unwrap(),
+                lr, beta1, beta2, eps, weight_decay, step
+            );
         }
 
         losses
@@ -1065,49 +1102,29 @@ impl ArcaModel {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    fn generate(&mut self, prompt: &str, max_tokens: usize, temperature: f32) -> String {
+    #[pyo3(signature = (prompt, max_tokens, temperature=0.7, top_p=0.9))]
+    fn generate(&mut self, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32) -> String {
         self.system.reset_state();
         let bytes = prompt.as_bytes();
         let bpe_ids = self.tokenizer.encode_aligned(bytes);
         
-        let mut prev_pred: Option<Array1<f32>> = None;
-        for t in 0..bytes.len() {
-            let output = self.system.forward_step(bytes, t, &bpe_ids, prev_pred.as_ref());
-            prev_pred = Some(output.next_prediction.clone());
-        }
-
         let mut generated_ids = Vec::new();
         let mut current_bytes = bytes.to_vec();
         let mut current_bpe_ids = bpe_ids.clone();
 
         for _ in 0..max_tokens {
             let t = current_bytes.len() - 1;
-            let output = self.system.forward_step(&current_bytes, t, &current_bpe_ids, prev_pred.as_ref());
-            prev_pred = Some(output.next_prediction.clone());
-
-            let next_token = if temperature <= 1e-5 {
-                output.logits.iter().cloned().enumerate()
-                    .fold((0, f32::NEG_INFINITY), |max, (idx, val)| if val > max.1 { (idx, val) } else { max }).0 as u32
-            } else {
-                let max_logit = output.logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let exps: Vec<f32> = output.logits.iter().map(|&l| ((l - max_logit) / temperature).exp()).collect();
-                let sum_exp: f32 = exps.iter().sum();
-                
-                use rand::Rng;
-                let mut rng = rand::thread_rng();
-                let target = rng.gen_range(0.0..sum_exp);
-                
-                let mut acc = 0.0;
-                let mut chosen = 0;
-                for (i, &e) in exps.iter().enumerate() {
-                    acc += e;
-                    if acc >= target {
-                        chosen = i;
-                        break;
-                    }
-                }
-                chosen as u32
-            };
+            
+            // Call Extreme Inference Path
+            let tokens = self.system.forward_step_extreme_inference(
+                &[current_bytes.clone()],
+                &[t],
+                &[current_bpe_ids.clone()],
+                temperature,
+                top_p
+            );
+            
+            let next_token = tokens[0];
 
             generated_ids.push(next_token);
             

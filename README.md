@@ -1,6 +1,6 @@
 # ARCA: Advanced Recurrent Cognitive Architecture
 
-![Version](https://img.shields.io/badge/version-v2.5.0-blue.svg)
+![Version](https://img.shields.io/badge/version-v2.6.0-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
 
@@ -12,7 +12,7 @@ ARCA est une architecture hybride de modèle de langage haute performance (wgpu 
 
 ---
 
-## 🚀 Fonctionnalités Clés (v2.5.0)
+## 🚀 Fonctionnalités Clés (v2.6.0)
 
 ARCA est spécifiquement optimisé pour éliminer le goulot d'étranglement des architectures hybrides : les transferts sur le bus PCIe et la bande passante mémoire.
 
@@ -23,14 +23,17 @@ Lors de l'inférence, **zéro synchronisation CPU-GPU n'a lieu** pour le calcul 
 3. **Zéro Readback** : Les états internes (`s_t`, KV-Cache, mémoire hebbienne) ne quittent jamais la VRAM.
 4. **Précision Mixte FP16** : Toutes les matrices statiques (Reservoir, Embeddings, Attention) sont stockées compressées en `f16` et dézippées (`unpack2x16float`) à la volée par les shaders WGSL, doublant virtuellement la Memory Bandwidth.
 
-### 🎲 Échantillonnage Top-K VRAM
+### 🎲 Échantillonnage Top-P VRAM (Nucleus Sampling)
 La sélection probabiliste est assistée par le GPU :
-Un shader de réduction multi-passes trouve les `K` meilleurs tokens et masque les logits. Le CPU ne lit que `B * K` paires `(Token, Logit)` (une poignée d'octets) pour appliquer la **Température** et un **Tirage Pondéré (Softmax)**.
+Un shader de réduction multi-passes trouve les `K` meilleurs tokens ou applique un filtrage **Top-P (Nucleus)** et masque les logits. Le CPU ne lit que les tokens finaux (une poignée d'octets) pour appliquer la **Température** et un **Tirage Pondéré (Softmax)** afin de garantir un texte fluide et cohérent.
 
-### 🏋️‍♂️ Entraînement Haute Performance (Zero-Sync Orchestré)
-- **Orchestration Explicite** : Le CPU orchestre le graphe d'apprentissage via des `dispatches` WGSL précis.
-- **Clean Swap Buffers** : L'état `s_t` et les matrices de mémoire Hebbiennes utilisent des "ping-pong buffers" gérés de façon *zero-copy* sur la VRAM.
-- **Readback Minimal Stable Point** : Les états `s_t` et les `logits` sont rappatriés en un seul appel synchronisé.
+### 🏋️‍♂️ Entraînement Full-GPU (AdamW & WGSL)
+L'entraînement de la tête de prédiction d'ARCA (plus de 55M de paramètres) est calculé à 100% sur la carte vidéo sans blocage CPU.
+- **Backpropagation in-place** : L'optimiseur AdamW est implémenté en pur WGSL.
+- **Zero-Transfert** : Le calcul des gradients (`grad_logits`, `grad_y_hidden`) et les mises à jour de mémoire se font intégralement sur le GPU.
+
+### ⚡ Tokenizer Multi-threadé (Rayon)
+L'apprentissage du vocabulaire via BPE a été optimisé par du calcul distribué (Map-Reduce) sur tous les cœurs du CPU, réduisant drastiquement le temps de scan des gros corpus de texte.
 
 ---
 
@@ -56,6 +59,15 @@ Moteur wgpu contenant tous les compute pipelines compilés et les buffers persis
 
 ### 3. Contrôleur Métabolique (CPU)
 Gère le "climat" (macro-variables) qui module la plasticité selon l'erreur de prédiction : $\beta$ (tension), $\lambda$ (oubli), $\sigma$ (homéostasie).
+
+### 4. API Python via PyO3 / Maturin
+ARCA est intégralement compilable et utilisable depuis Python.
+```python
+import arca
+model = arca.ArcaModel("modele.sovereign", "tokenizer.json")
+model.train(corpus, "modele.sovereign", 64)
+print(model.generate("Texte", max_tokens=50, temperature=0.7, top_p=0.9))
+```
 
 ---
 

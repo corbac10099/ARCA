@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use rayon::prelude::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -99,10 +100,24 @@ impl BpeTokenizer {
             }
 
             // --- Count pairs ---
-            let mut pair_counts: HashMap<(u32, u32), u32> = HashMap::new();
-            for w in ids.windows(2) {
-                *pair_counts.entry((w[0], w[1])).or_insert(0) += 1;
-            }
+            let pair_counts = ids
+                .par_windows(2)
+                .fold(
+                    || HashMap::new(),
+                    |mut acc: HashMap<(u32, u32), u32>, w| {
+                        *acc.entry((w[0], w[1])).or_insert(0) += 1;
+                        acc
+                    },
+                )
+                .reduce(
+                    || HashMap::new(),
+                    |mut acc1, acc2| {
+                        for (k, v) in acc2 {
+                            *acc1.entry(k).or_insert(0) += v;
+                        }
+                        acc1
+                    },
+                );
 
             // --- Find best pair (tie-break: lowest id sum for determinism) ---
             let best = pair_counts
@@ -343,9 +358,9 @@ mod tests {
     fn save_load_roundtrip() {
         let corpus = b"abracadabra";
         let tok = BpeTokenizer::train(corpus, 5, 300);
-        let path = "/tmp/test_tokenizer.json";
-        tok.save_to_json(path).unwrap();
-        let tok2 = BpeTokenizer::load_from_json(path).unwrap();
+        let path = std::env::temp_dir().join("test_tokenizer.json");
+        tok.save_to_json(&path).unwrap();
+        let tok2 = BpeTokenizer::load_from_json(&path).unwrap();
         assert_eq!(tok.merges, tok2.merges);
         assert_eq!(tok.encode(corpus), tok2.encode(corpus));
     }

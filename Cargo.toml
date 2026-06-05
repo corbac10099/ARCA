@@ -37,6 +37,7 @@ bytemuck   = { version = "1.14", features = ["derive"], optional = true }
 pollster   = { version = "0.3",  optional = true }
 
 pyo3 = { version = "0.20", features = ["extension-module"] }
+rayon = "1.12.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Release profile

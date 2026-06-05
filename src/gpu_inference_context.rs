@@ -508,6 +508,105 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
 }
 "#;
 
+pub const BACKWARD_SHADER: &str = r#"
+@group(0) @binding(0) var<storage, read> grad_logits: array<f32>;
+@group(0) @binding(1) var<storage, read> y_hidden: array<f32>;
+@group(0) @binding(2) var<storage, read> s_t: array<f32>;
+
+@group(0) @binding(3) var<storage, read_write> out_emb: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out_bias: array<f32>;
+@group(0) @binding(5) var<storage, read_write> w_out: array<f32>;
+
+@group(0) @binding(6) var<storage, read_write> m_out_emb: array<f32>;
+@group(0) @binding(7) var<storage, read_write> v_out_emb: array<f32>;
+@group(0) @binding(8) var<storage, read_write> m_out_bias: array<f32>;
+@group(0) @binding(9) var<storage, read_write> v_out_bias: array<f32>;
+@group(0) @binding(10) var<storage, read_write> m_w_out: array<f32>;
+@group(0) @binding(11) var<storage, read_write> v_w_out: array<f32>;
+
+@group(0) @binding(12) var<storage, read_write> grad_y_hidden: array<f32>;
+
+struct AdamWParams {
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    step: f32,
+}
+@group(0) @binding(13) var<uniform> params: AdamWParams;
+
+const VOCAB_SIZE_C: u32 = 50000u;
+const D_MODEL_C: u32 = 1024u;
+const N_RES_C: u32 = 4096u;
+
+fn adamw_update(w_prev: f32, grad: f32, m_prev: f32, v_prev: f32, m_new_ptr: ptr<function, f32>, v_new_ptr: ptr<function, f32>) -> f32 {
+    let m_new = params.beta1 * m_prev + (1.0 - params.beta1) * grad;
+    let v_new = params.beta2 * v_prev + (1.0 - params.beta2) * grad * grad;
+    *m_new_ptr = m_new;
+    *v_new_ptr = v_new;
+
+    let m_hat = m_new / (1.0 - pow(params.beta1, params.step));
+    let v_hat = v_new / (1.0 - pow(params.beta2, params.step));
+
+    let update = params.lr * (m_hat / (sqrt(v_hat) + params.eps) + params.weight_decay * w_prev);
+    return w_prev - update;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn update_out_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let v = gid.x;
+    if (v >= VOCAB_SIZE_C) { return; }
+    
+    let grad = grad_logits[v];
+    var m_new: f32; var v_new: f32;
+    out_bias[v] = adamw_update(out_bias[v], grad, m_out_bias[v], v_out_bias[v], &m_new, &v_new);
+    m_out_bias[v] = m_new;
+    v_out_bias[v] = v_new;
+}
+
+@compute @workgroup_size(64, 4, 1)
+fn update_out_emb(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let v = gid.x;
+    let d = gid.y;
+    if (v >= VOCAB_SIZE_C || d >= D_MODEL_C) { return; }
+    let idx = v * D_MODEL_C + d;
+    
+    let grad = grad_logits[v] * y_hidden[d];
+    
+    var m_new: f32; var v_new: f32;
+    out_emb[idx] = adamw_update(out_emb[idx], grad, m_out_emb[idx], v_out_emb[idx], &m_new, &v_new);
+    m_out_emb[idx] = m_new;
+    v_out_emb[idx] = v_new;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn compute_grad_y_hidden(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = gid.x;
+    if (d >= D_MODEL_C) { return; }
+    
+    var sum = 0.0;
+    for (var v = 0u; v < VOCAB_SIZE_C; v++) {
+        sum += grad_logits[v] * out_emb[v * D_MODEL_C + d];
+    }
+    grad_y_hidden[d] = sum;
+}
+
+@compute @workgroup_size(4, 64, 1)
+fn update_w_out(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = gid.x;
+    let r = gid.y;
+    if (d >= D_MODEL_C || r >= N_RES_C) { return; }
+    let idx = d * N_RES_C + r;
+    
+    let grad = grad_y_hidden[d] * s_t[r];
+    
+    var m_new: f32; var v_new: f32;
+    w_out[idx] = adamw_update(w_out[idx], grad, m_w_out[idx], v_w_out[idx], &m_new, &v_new);
+    m_w_out[idx] = m_new;
+    v_w_out[idx] = v_new;
+}
+"#;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GpuInferenceContext
@@ -579,6 +678,23 @@ pub struct GpuInferenceContext {
     pub max_batch_size: usize,
     pub buf_encoder_batch_inputs: Vec<wgpu::Buffer>,
     
+
+    // Backward & AdamW
+    pub backward_pl_bias: wgpu::ComputePipeline,
+    pub backward_pl_emb: wgpu::ComputePipeline,
+    pub backward_pl_grad_y: wgpu::ComputePipeline,
+    pub backward_pl_w_out: wgpu::ComputePipeline,
+    pub backward_bgl: wgpu::BindGroupLayout,
+
+    pub buf_grad_logits: wgpu::Buffer,
+    pub buf_grad_y_hidden: wgpu::Buffer,
+    pub buf_m_out_emb: wgpu::Buffer,
+    pub buf_v_out_emb: wgpu::Buffer,
+    pub buf_m_out_bias: wgpu::Buffer,
+    pub buf_v_out_bias: wgpu::Buffer,
+    pub buf_m_w_out: wgpu::Buffer,
+    pub buf_v_w_out: wgpu::Buffer,
+    pub buf_adamw_params: wgpu::Buffer,
     num_layers: usize,
 }
 
@@ -621,6 +737,7 @@ impl GpuInferenceContext {
                 required_limits: wgpu::Limits {
                     max_buffer_size: 256 * 1024 * 1024,
                     max_storage_buffer_binding_size: 256 * 1024 * 1024,
+                    max_storage_buffers_per_shader_stage: 16,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -638,6 +755,10 @@ impl GpuInferenceContext {
         let agg_mod = create_shader(AGGREGATE_SHADER, "agg_mod");
         let log_mod = create_shader(LOGIT_SHADER, "log_mod");
         let samp_mod = create_shader(SAMPLING_SHADER, "samp_mod");
+        let backward_mod = create_shader(BACKWARD_SHADER, "backward_mod");
+
+        let backward_mod = create_shader(BACKWARD_SHADER, "backward_mod");
+
 
         let ro = |b| wgpu::BindGroupLayoutEntry {
             binding: b, visibility: wgpu::ShaderStages::COMPUTE,
@@ -656,12 +777,36 @@ impl GpuInferenceContext {
         };
 
         let attn_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), ro(3), ro(4), rw(5), rw(6), rw(7), uni(8)] });
-        let enc_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), ro(4)] });
+        let enc_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), ro(4), uni(5)] });
         let res_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), ro(3), rw(4)] });
         let proj_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), rw(4), uni(5)] });
         let agg_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3), rw(4), uni(5)] });
         let log_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ro(0), ro(1), ro(2), rw(3)] });
         let samp_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[rw(0), rw(1), rw(2)] });
+        let uni = |b| wgpu::BindGroupLayoutEntry {
+            binding: b, visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let backward_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backward_bgl"),
+            entries: &[
+                ro(0), ro(1), ro(2), rw(3), rw(4), rw(5), rw(6), rw(7), rw(8), rw(9), rw(10), rw(11), rw(12), uni(13)
+            ],
+        });
+
+        let uni = |b| wgpu::BindGroupLayoutEntry {
+            binding: b, visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let backward_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backward_bgl"),
+            entries: &[
+                ro(0), ro(1), ro(2), rw(3), rw(4), rw(5), rw(6), rw(7), rw(8), rw(9), rw(10), rw(11), rw(12), uni(13)
+            ],
+        });
+
 
         let make_pl = |m, bgl| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[bgl], push_constant_ranges: &[] });
@@ -676,15 +821,32 @@ impl GpuInferenceContext {
         let log_pl = make_pl(&log_mod, &log_bgl);
         let samp_pl = make_pl(&samp_mod, &samp_bgl);
 
+        let backward_pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("backward_pll"), bind_group_layouts: &[&backward_bgl], push_constant_ranges: &[],
+        });
+        let backward_pl_bias = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("backward_pl_bias"), layout: Some(&backward_pll), module: &backward_mod, entry_point: "update_out_bias", compilation_options: Default::default(),
+        });
+        let backward_pl_emb = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("backward_pl_emb"), layout: Some(&backward_pll), module: &backward_mod, entry_point: "update_out_emb", compilation_options: Default::default(),
+        });
+        let backward_pl_grad_y = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("backward_pl_grad_y"), layout: Some(&backward_pll), module: &backward_mod, entry_point: "compute_grad_y_hidden", compilation_options: Default::default(),
+        });
+        let backward_pl_w_out = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("backward_pl_w_out"), layout: Some(&backward_pll), module: &backward_mod, entry_point: "update_w_out", compilation_options: Default::default(),
+        });
+
         let upload = |data: &[f32], lbl: &str| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(lbl), contents: bytemuck::cast_slice(data), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC });
         let upload_u32 = |data: &[u32], lbl: &str| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(lbl), contents: bytemuck::cast_slice(data), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC });
         let empty = |n: usize, lbl: &str| device.create_buffer(&wgpu::BufferDescriptor { label: Some(lbl), size: (n*4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let uniform = |n: usize, lbl: &str| device.create_buffer(&wgpu::BufferDescriptor { label: Some(lbl), size: (n*4) as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let readback = |n: usize, lbl: &str| device.create_buffer(&wgpu::BufferDescriptor { label: Some(lbl), size: (n*4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
         let buf_bpe_embeddings = upload_u32(&pack_f32_to_f16(bpe_embeddings_data), "bpe_emb");
         let buf_w_fusion = upload_u32(&pack_f32_to_f16(w_fusion_data), "w_fus");
         let buf_w_phrase = upload_u32(&pack_f32_to_f16(w_phrase_data), "w_phr");
-        let buf_encoder_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("enc_p"), size: (max_batch_size * 64) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let buf_encoder_params = uniform(max_batch_size * 16, "enc_p");
         let buf_r = upload_u32(&pack_f32_to_f16(r_matrix_data), "r");
         let buf_w_in = upload_u32(&pack_f32_to_f16(w_in_data), "w_in");
         let buf_w_q = upload_u32(&pack_f32_to_f16(w_q_data), "w_q");
@@ -694,7 +856,7 @@ impl GpuInferenceContext {
         let buf_k_cache = empty(max_batch_size * 1024 * D_MODEL, "k_cache");
         let buf_v_cache = empty(max_batch_size * 1024 * D_MODEL, "v_cache");
         let buf_x_attn = empty(max_batch_size * D_MODEL, "x_attn");
-        let buf_attn_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("attn_params"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let buf_attn_params = uniform(4, "attn_p");
     
         let buf_s = [empty(max_batch_size * N_RES, "s0"), empty(max_batch_size * N_RES, "s1")];
         let buf_x_t = empty(max_batch_size * D_MODEL, "x_t");
@@ -713,12 +875,29 @@ impl GpuInferenceContext {
         let buf_num_layers = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("num_layers"),
             contents: bytemuck::cast_slice(&[num_layers as u32]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let buf_out_emb = upload_u32(&pack_f32_to_f16(out_emb_data), "emb");
         let buf_out_bias = upload_u32(&pack_f32_to_f16(out_bias_data), "bias");
         let buf_logits = empty(max_batch_size * VOCAB_SIZE, "log");
+
+        let buf_grad_logits = empty(max_batch_size * 50000, "grad_logits");
+        let buf_grad_y_hidden = empty(max_batch_size * D_MODEL, "grad_y_hidden");
+        let buf_m_out_emb = empty(50000 * D_MODEL, "m_out_emb");
+        let buf_v_out_emb = empty(50000 * D_MODEL, "v_out_emb");
+        let buf_res_params = uniform(6, "res_p");
+        let buf_proj_params = uniform(8, "proj_p");
+        let buf_agg_params = uniform(4, "agg_p");
+        let buf_samp_params = uniform(4, "samp_p");
+        let buf_layer_params = uniform(4, "layer_p");
+        let buf_b_layer_params = uniform(4, "b_layer_p");
+        let buf_m_out_bias = empty(50000, "m_out_bias");
+        let buf_v_out_bias = empty(50000, "v_out_bias");
+        let buf_m_w_out = empty(D_MODEL * 4096, "m_w_out");
+        let buf_v_w_out = empty(D_MODEL * 4096, "v_w_out");
+        let buf_adamw_params = uniform(32, "adamw_params");
+
         let buf_top_k_tokens = empty(max_batch_size * 50, "token_k");
         let buf_top_k_probs = empty(max_batch_size * 50, "prob_k");
         let buf_top_k_tokens_readback = readback(max_batch_size * 50, "token_k_rb");
@@ -735,7 +914,20 @@ impl GpuInferenceContext {
             max_batch_size,
             buf_out_emb, buf_out_bias, buf_logits, buf_top_k_tokens, buf_top_k_probs, buf_top_k_tokens_readback, buf_top_k_probs_readback, top_k_size,
             num_layers,
-
+            backward_pl_bias,
+            backward_pl_emb,
+            backward_pl_grad_y,
+            backward_pl_w_out,
+            backward_bgl,
+            buf_grad_logits,
+            buf_grad_y_hidden,
+            buf_m_out_emb,
+            buf_v_out_emb,
+            buf_m_out_bias,
+            buf_v_out_bias,
+            buf_m_w_out,
+            buf_v_w_out,
+            buf_adamw_params,
         }
     }
 
@@ -779,13 +971,14 @@ impl GpuInferenceContext {
 
         // 0. Encoder
         let bg_enc = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None, layout: &self.attn_bgl,
+            label: None, layout: &self.enc_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.buf_bpe_embeddings.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.buf_w_fusion.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.buf_w_phrase.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.buf_x_t.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.buf_encoder_batch_inputs[b].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.buf_encoder_batch_inputs[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.buf_encoder_params.as_entire_binding() },
             ],
         });
         {
@@ -944,5 +1137,70 @@ impl GpuInferenceContext {
         
         (out_tokens, out_probs)
     
+    }
+
+    pub fn dispatch_backward(
+        &mut self,
+        grad_logits: &[f32],
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        step: f32,
+    ) {
+        // Upload grad_logits (50000 floats)
+        self.queue.write_buffer(&self.buf_grad_logits, 0, bytemuck::cast_slice(grad_logits));
+
+        // Upload AdamW parameters
+        let params = [lr, beta1, beta2, eps, weight_decay, step, 0.0, 0.0];
+        self.queue.write_buffer(&self.buf_adamw_params, 0, bytemuck::cast_slice(&params));
+
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.backward_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.buf_grad_logits.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.buf_y_hidden.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.buf_s[self.s_ping].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.buf_out_emb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.buf_out_bias.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.buf_w_out.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.buf_m_out_emb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.buf_v_out_emb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.buf_m_out_bias.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.buf_v_out_bias.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: self.buf_m_w_out.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.buf_v_w_out.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: self.buf_grad_y_hidden.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.buf_adamw_params.as_entire_binding() },
+            ]
+        });
+
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            cp.set_bind_group(0, &bg, &[]);
+            
+            // 1. Update bias
+            cp.set_pipeline(&self.backward_pl_bias);
+            cp.dispatch_workgroups((50000 + 255) / 256, 1, 1);
+            
+            // 2. Update emb
+            cp.set_pipeline(&self.backward_pl_emb);
+            cp.dispatch_workgroups((50000 + 63) / 64, (1024 + 3) / 4, 1);
+            
+            // 3. Compute grad_y_hidden
+            cp.set_pipeline(&self.backward_pl_grad_y);
+            cp.dispatch_workgroups((1024 + 255) / 256, 1, 1);
+            
+            // 4. Update W_out
+            cp.set_pipeline(&self.backward_pl_w_out);
+            cp.dispatch_workgroups((1024 + 3) / 4, (4096 + 63) / 64, 1);
+        }
+
+        self.queue.submit(std::iter::once(enc.finish()));
+        // Note: we do NOT poll device here. The GPU will asynchronously execute the backward pass and AdamW updates.
+        // It's fully pipelined!
     }
 }
