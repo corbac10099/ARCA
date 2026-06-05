@@ -214,16 +214,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     workgroupBarrier();
 
     if tid == 0u {
-        let b = array<u32, 3>(batch_inputs[b].byte_0, batch_inputs[b].byte_1, batch_inputs[b].byte_2);
+        let b_arr = array<u32, 3>(batch_inputs[b].byte_0, batch_inputs[b].byte_1, batch_inputs[b].byte_2);
         var e_bytes_local = array<f32, 128>();
         for (var i=0u; i<128u; i++) { e_bytes_local[i] = 0.0; }
 
         for (var n = 1u; n <= 3u; n++) {
             if batch_inputs[b].t + 1u >= n {
                 var gram = array<u32, 3>(0u, 0u, 0u);
-                if n == 1u { gram[0] = b[0]; }
-                else if n == 2u { gram[0] = b[1]; gram[1] = b[0]; }
-                else if n == 3u { gram[0] = b[2]; gram[1] = b[1]; gram[2] = b[0]; }
+                if n == 1u { gram[0] = b_arr[0]; }
+                else if n == 2u { gram[0] = b_arr[1]; gram[1] = b_arr[0]; }
+                else if n == 3u { gram[0] = b_arr[2]; gram[1] = b_arr[1]; gram[2] = b_arr[0]; }
                 
                 let h = ngram_hash(gram, n);
                 let bucket = h % 128u;
@@ -251,7 +251,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     }
 
     if tid < 64u {
-        let bpes = array<u32, 8>(batch_inputs[b].bpe_0, batch_inputs[b].bpe_1, batch_inputs[b].bpe_2, batch_inputs[b].bpe_3, batch_inputs[b].bpe_4, batch_inputs[b].bpe_5, batch_inputs[b].bpe_6, batch_inputs[b].bpe_7);
+        var bpes = array<u32, 8>(batch_inputs[b].bpe_0, batch_inputs[b].bpe_1, batch_inputs[b].bpe_2, batch_inputs[b].bpe_3, batch_inputs[b].bpe_4, batch_inputs[b].bpe_5, batch_inputs[b].bpe_6, batch_inputs[b].bpe_7);
         let win = batch_inputs[b].window_size;
         
         for (var p = 0u; p < 2u; p++) {
@@ -318,7 +318,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc_w: f32 = 0.0;
     let row_w: u32 = i * D_MODEL_C;
     for (var m = 0u; m < D_MODEL_C; m++) {
-        acc_w += get_f16_val(w_in[(row_w + m) / 2u], row_w + m) * x_attn[b * D_MODEL_C + m];
+        acc_w += get_f16_val(w_in[(row_w + m) / 2u], row_w + m) * x_t[b * D_MODEL_C + m];
     }
     s_out[b * N_RES_C + i] = tanh(acc_r + acc_w);
 }
@@ -472,7 +472,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         var max_idx = 0u;
 
         for (var i = lid; i < VOCAB_SIZE_C; i += stride) {
-            let v = logits_out[b * N_RES_C + i];
+            let v = logits_out[b * VOCAB_SIZE_C + i];
             if v > max_val {
                 max_val = v;
                 max_idx = i;
