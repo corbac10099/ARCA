@@ -187,8 +187,16 @@ var<workgroup> concat: array<f32, 512>;
 
 fn ngram_hash(bytes: array<u32, 3>, len: u32) -> u32 {
     var h: u32 = 2166136261u;
-    for (var i = 0u; i < len; i++) {
-        h = h ^ bytes[i];
+    if len > 0u {
+        h = h ^ bytes[0];
+        h = h * 16777619u;
+    }
+    if len > 1u {
+        h = h ^ bytes[1];
+        h = h * 16777619u;
+    }
+    if len > 2u {
+        h = h ^ bytes[2];
         h = h * 16777619u;
     }
     return h;
