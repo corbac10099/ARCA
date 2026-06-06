@@ -496,9 +496,10 @@ impl ArcaSystem {
         self.tension = tension_new;
 
         // 1. Upload x_t and e_t
-        let x_t_flat: Vec<f32> = x_t.iter().cloned().collect();
-        let e_t_flat: Vec<f32> = e_t.iter().cloned().collect();
-        self.gpu.upload_x_and_e(&x_t_flat, &e_t_flat);
+        // We use as_slice() to avoid cloning and allocating a Vec<f32> at every single token step!
+        let x_t_slice = x_t.as_slice().expect("x_t is not contiguous");
+        let e_t_slice = e_t.as_slice().expect("e_t is not contiguous");
+        self.gpu.upload_x_and_e(x_t_slice, e_t_slice);
 
         // 2. Build the command buffer for explicit orchestration
         let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -942,8 +943,8 @@ fn run_train(sovereign_path: &str, tokenizer_path: &str) {
     assert_eq!(bpe_ids.len(), corpus.len());
 
     const WINDOW: usize = 64;
-    let batches = build_batches(corpus, &bpe_ids, WINDOW);
-    eprintln!("[ARCA] {} batches of {} bytes.", batches.len(), WINDOW);
+    let batch_starts = build_batches(corpus.len(), WINDOW);
+    eprintln!("[ARCA] {} batches of {} bytes.", batch_starts.len(), WINDOW);
 
     system.reset_state();
 
@@ -951,9 +952,9 @@ fn run_train(sovereign_path: &str, tokenizer_path: &str) {
     let mut global_step = 0usize;
     let mut total_loss  = 0.0_f32;
 
-    for (batch_idx, batch) in batches.iter().enumerate() {
-        let bytes = &batch.bytes;
-        let ids   = &batch.bpe_ids;
+    for (batch_idx, &start_idx) in batch_starts.iter().enumerate() {
+        let bytes = &corpus[start_idx..start_idx + WINDOW];
+        let ids   = &bpe_ids[start_idx..start_idx + WINDOW];
         let mut prev_pred: Option<Array1<f32>> = None;
 
         for t in 0..bytes.len().saturating_sub(1) {
@@ -1137,26 +1138,28 @@ impl ArcaModel {
         String::from_utf8_lossy(&gen_bytes).into_owned()
     }
 
-    fn train(&mut self, corpus: &str, save_path: &str, window_size: usize) -> PyResult<()> {
+    #[pyo3(signature = (corpus, save_path, window_size, throttle_ms=10))]
+    fn train(&mut self, corpus: &str, save_path: &str, window_size: usize, throttle_ms: u64) -> PyResult<()> {
         let bytes = corpus.as_bytes();
         let bpe_ids = self.tokenizer.encode_aligned(bytes);
-        let batches = build_batches(bytes, &bpe_ids, window_size);
+        let batch_starts = build_batches(bytes.len(), window_size);
         
-        eprintln!("[ARCA] Training on {} batches of {} bytes.", batches.len(), window_size);
+        eprintln!("[ARCA] Training on {} batches of {} bytes (Throttle: {}ms).", batch_starts.len(), window_size, throttle_ms);
         self.system.reset_state();
         
-        // Since we don't store header, we construct a default one matching the random init
-        // In a full implementation, we'd persist the original header on ArcaSystem
         let header = SovereignHeader::default();
         let mut global_step = 0usize;
         let mut total_loss = 0.0_f32;
 
-        for (batch_idx, batch) in batches.iter().enumerate() {
-            let b_bytes = &batch.bytes;
-            let ids   = &batch.bpe_ids;
+        for (batch_idx, &start_idx) in batch_starts.iter().enumerate() {
+            let b_bytes = &bytes[start_idx..start_idx + window_size];
+            let ids   = &bpe_ids[start_idx..start_idx + window_size];
             let mut prev_pred: Option<Array1<f32>> = None;
+            
+            let t_len = b_bytes.len().saturating_sub(1);
+            let delay_micros = if t_len > 0 { (throttle_ms * 1000) / (t_len as u64) } else { 0 };
 
-            for t in 0..b_bytes.len().saturating_sub(1) {
+            for t in 0..t_len {
                 let output = self.system.forward_step(b_bytes, t, ids, prev_pred.as_ref());
                 let target = b_bytes[t + 1] as usize % VOCAB_SIZE;
                 let losses = self.system.backward_step(&output, target);
@@ -1168,6 +1171,10 @@ impl ArcaModel {
                 total_loss += losses.total;
                 global_step += 1;
                 prev_pred = Some(output.next_prediction);
+                
+                if delay_micros > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(delay_micros));
+                }
             }
             self.system.reset_state();
         }

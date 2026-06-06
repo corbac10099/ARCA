@@ -12,8 +12,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "arca"
-version = "0.1.6"
+name = "arca-core"
+version = "0.3.2"
 dependencies = [
  "bytemuck",
  "half",

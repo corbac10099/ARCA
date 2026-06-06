@@ -237,26 +237,11 @@ impl std::fmt::Display for LossComponents {
 // Batch training helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A single training sample: byte sequence with its aligned BPE ids.
-pub struct TrainSample {
-    pub bytes: Vec<u8>,
-    pub bpe_ids: Vec<u32>,
-}
-
-/// Slice a corpus into non-overlapping windows of `window_size` bytes.
-///
-/// Each window becomes one `TrainSample`.  The last incomplete window is
-/// dropped so every sample has exactly `window_size` bytes.
-pub fn build_batches(corpus: &[u8], bpe_ids: &[u32], window_size: usize) -> Vec<TrainSample> {
-    assert_eq!(corpus.len(), bpe_ids.len());
-    corpus
-        .windows(window_size)
-        .zip(bpe_ids.windows(window_size))
-        .step_by(window_size)          // non-overlapping
-        .map(|(b, ids)| TrainSample {
-            bytes: b.to_vec(),
-            bpe_ids: ids.to_vec(),
-        })
+/// Return starting indices for non-overlapping windows of `window_size` bytes.
+pub fn build_batches(corpus_len: usize, window_size: usize) -> Vec<usize> {
+    (0..corpus_len)
+        .step_by(window_size)
+        .filter(|&i| i + window_size <= corpus_len)
         .collect()
 }
 
