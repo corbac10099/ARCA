@@ -1,0 +1,1 @@
+D:\code\ARCA\target\release\arca.dll: D:\code\ARCA\src\encoder.rs D:\code\ARCA\src\gpu_context.rs D:\code\ARCA\src\gpu_inference_context.rs D:\code\ARCA\src\lib.rs D:\code\ARCA\src\memory.rs D:\code\ARCA\src\metabolic_core.rs D:\code\ARCA\src\sovereign.rs D:\code\ARCA\src\tokenizer.rs D:\code\ARCA\src\train.rs

@@ -1173,7 +1173,10 @@ impl ArcaModel {
                 prev_pred = Some(output.next_prediction);
                 
                 if delay_micros > 0 {
-                    std::thread::sleep(std::time::Duration::from_micros(delay_micros));
+                    let start = std::time::Instant::now();
+                    while start.elapsed().as_micros() < delay_micros as u128 {
+                        std::hint::spin_loop();
+                    }
                 }
             }
             self.system.reset_state();
