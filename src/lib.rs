@@ -1161,7 +1161,7 @@ impl ArcaModel {
 
             for t in 0..t_len {
                 let output = self.system.forward_step(b_bytes, t, ids, prev_pred.as_ref());
-                let target = b_bytes[t + 1] as usize % VOCAB_SIZE;
+                let target = ids[t + 1] as usize % VOCAB_SIZE;
                 let losses = self.system.backward_step(&output, target);
                 
                 if global_step % 100 == 0 {
